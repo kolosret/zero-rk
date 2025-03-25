@@ -238,18 +238,21 @@ zerork_status_t ZeroRKReactorManager::LoadMechanism() {
 
 #ifdef ZERORK_GPU
 //Auto-assigns based on node rank
-//Use CUDA_VISIBLE_DEVICES to choose/re-order
+
 void ZeroRKReactorManager::AssignGpuId() {
   if(gpu_id_ == -2) {
 #ifdef USE_MPI
     gpu_id_ = -1;
+      // Determine the rank number, number of ranks, and the names
     int rank, nprocs, namelen;
     char host_name[MPI_MAX_PROCESSOR_NAME] = "";
     MPI_Comm communicator = MPI_COMM_WORLD;
     MPI_Comm_rank(communicator, &rank);
     MPI_Comm_size(communicator, &nprocs);
+    if (rank==0) printf("The total number of processors %d. \n",nprocs);
     MPI_Get_processor_name(host_name,&namelen);
 
+    //Determine host names of the ranks
     std::vector<std::string> host_names(nprocs);
     host_names[rank] = host_name;
     for(int n=0; n<nprocs; n++) {
@@ -271,9 +274,44 @@ void ZeroRKReactorManager::AssignGpuId() {
     MPI_Comm_split(communicator, color, 0, &nodeComm);
     MPI_Comm_rank(nodeComm, &node_rank);
     MPI_Comm_free(&nodeComm);
+
+    //This works if job is launched wit --exclusive and --mpibind on with flux
+    std::vector<int> gpuVecLoc(nprocs, -1);
+    std::vector<int> gpuVec(nprocs, -1);
+
+    int visDevice;
+    if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
+        visDevice = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+    }
+
+    gpuVecLoc[rank] = visDevice;
+
+    MPI_Barrier(communicator);
+    MPI_Allreduce(gpuVecLoc.data(), gpuVec.data(), nprocs, MPI_INT, MPI_MAX, communicator);
+
+    MPI_Bcast(gpuVec.data(), nprocs, MPI_INT, 0, communicator);
+
+    std::cout << "Rank " << rank << " received vector: ";
+    for (int val : gpuVec) {
+        std::cout << val << " ";
+    }
+    std::cout << std::endl;
+
+    bool assignGpu=true;
+    for(int i=0;i<rank;i++){
+        if (gpuVec[i]==visDevice){
+            assignGpu=false;
+            break;
+        }
+    }
+
+    if (assignGpu) gpu_id_=visDevice;
+//    printf("Set the device %d on node %s rank %d \n", gpu_id_, host_name, rank);
+
 #else
+
+    //Old way, assigning a adevice to multiple hosts
    int node_rank = 0;
-#endif
 
     int ranks_per_gpu = 1;
     if(getenv("ZERORK_GPU_MPS_RANKS") != NULL) {
@@ -281,22 +319,38 @@ void ZeroRKReactorManager::AssignGpuId() {
     }
     /* Assign device to MPI process*/
     int n_devices;
-    hipGetDeviceCount(&n_devices);
+    hipGetDeviceCount(&n_devices); // the output of this depends on the flux allocation
+
+      const char* path_var = std::getenv("ROCR_VISIBLE_DEVICES");
+
+//      printf("ROCR_VISIBLE_DEVICES: is %c on rank %d. \n",path_var,rank);
+        std::cout << "ROCR_VISIBLE_DEVICES: " << path_var << " on rank " << rank <<std::endl;
+
+      if(getenv("ZERORK_GPU_PER_RANKS") != NULL) {
+          n_devices = atoi(getenv("ZERORK_GPU_PER_RANKS")); //This is gpu per rank
+      }
+
+
     if(node_rank / n_devices < ranks_per_gpu) {
       gpu_id_ = node_rank % n_devices;
     }
     if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
-      if (rank==0) printf("Setting gpu id from ROCR_VISIBLE_DEVICES ...\n");
-      gpu_id_ = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        if (gpu_id_>=0) {
+            if (rank == 0) printf("Setting gpu id from ROCR_VISIBLE_DEVICES ...\n");
+            gpu_id_ = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        }
     }
+#endif
+
     if(gpu_id_ >= 0) {
 #ifdef USE_MPI
       printf("Assigning device %d to process on node %s rank %d \n", gpu_id_, host_name, rank);
 #else
-      printf("Assigning device %d to process\n", gpu_id_);
+      printf("Assigning device %d to process \n", gpu_id_);
 #endif
       hipSetDevice(gpu_id_);
       hipDeviceSynchronize();
+//        printf("Set the device %d on node %s rank %d \n", gpu_id_, host_name, rank);
       if(hipGetLastError() != hipSuccess) {
         //Failed to set device.  Fall back to cpu.
         gpu_id_ = -1;
@@ -1466,5 +1520,6 @@ void ZeroRKReactorManager::DumpReactor(std::string tag, int id, double T, double
       dump_file << "\n";
       dump_file.close();
 }
+
 
 
