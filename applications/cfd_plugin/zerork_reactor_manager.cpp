@@ -275,28 +275,35 @@ void ZeroRKReactorManager::AssignGpuId() {
     MPI_Comm_rank(nodeComm, &node_rank);
     MPI_Comm_free(&nodeComm);
 
-    //This works if job is launched wit --exclusive and --mpibind on with flux
+    //Get create a local and a global vector where the gpus visible to each rank are stored
+    //This works if job is launched wit --exclusive and --mpibind on with flux, which ensure the right binding
     std::vector<int> gpuVecLoc(nprocs, -1);
     std::vector<int> gpuVec(nprocs, -1);
 
+    //Determine which devices are visible to the currecnt rank
     int visDevice;
-    if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
-        visDevice = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+    if(int_options_["verbosity"] > 0) {
+        if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
+            visDevice = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        }
     }
-
     gpuVecLoc[rank] = visDevice;
 
+    //Syncronize and communicate the visible devices to all the ranks
     MPI_Barrier(communicator);
     MPI_Allreduce(gpuVecLoc.data(), gpuVec.data(), nprocs, MPI_INT, MPI_MAX, communicator);
-
     MPI_Bcast(gpuVec.data(), nprocs, MPI_INT, 0, communicator);
 
-    std::cout << "Rank " << rank << " received vector: ";
-    for (int val : gpuVec) {
-        std::cout << val << " ";
+    if(int_options_["verbosity"] > 3) {
+        std::cout << "Rank " << rank << " received vector: ";
+        for (int val : gpuVec) {
+            std::cout << val << " ";
+        }
+        std::cout << std::endl;
     }
-    std::cout << std::endl;
 
+    //Set the device to the host with the lowest rank
+    //Additional logic can be implemented here for oversubscription
     bool assignGpu=true;
     for(int i=0;i<rank;i++){
         if (gpuVec[i]==visDevice){
@@ -310,7 +317,7 @@ void ZeroRKReactorManager::AssignGpuId() {
 
 #else
 
-    //Old way, assigning a adevice to multiple hosts
+   //Old way, assigning a adevice to multiple ranks, this section needs to be checked
    int node_rank = 0;
 
     int ranks_per_gpu = 1;
@@ -319,21 +326,19 @@ void ZeroRKReactorManager::AssignGpuId() {
     }
     /* Assign device to MPI process*/
     int n_devices;
-    hipGetDeviceCount(&n_devices); // the output of this depends on the flux allocation
+    // the output of this depends on the flux allocation
+    hipGetDeviceCount(&n_devices);
 
-      const char* path_var = std::getenv("ROCR_VISIBLE_DEVICES");
-
-//      printf("ROCR_VISIBLE_DEVICES: is %c on rank %d. \n",path_var,rank);
+    if(int_options_["verbosity"] > 0) {
+        const char* path_var = std::getenv("ROCR_VISIBLE_DEVICES");
         std::cout << "ROCR_VISIBLE_DEVICES: " << path_var << " on rank " << rank <<std::endl;
+    }
 
-      if(getenv("ZERORK_GPU_PER_RANKS") != NULL) {
-          n_devices = atoi(getenv("ZERORK_GPU_PER_RANKS")); //This is gpu per rank
-      }
-
-
+    //This method doesnt ensure correct binding
     if(node_rank / n_devices < ranks_per_gpu) {
       gpu_id_ = node_rank % n_devices;
     }
+
     if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
         if (gpu_id_>=0) {
             if (rank == 0) printf("Setting gpu id from ROCR_VISIBLE_DEVICES ...\n");
@@ -350,7 +355,6 @@ void ZeroRKReactorManager::AssignGpuId() {
 #endif
       hipSetDevice(gpu_id_);
       hipDeviceSynchronize();
-//        printf("Set the device %d on node %s rank %d \n", gpu_id_, host_name, rank);
       if(hipGetLastError() != hipSuccess) {
         //Failed to set device.  Fall back to cpu.
         gpu_id_ = -1;
