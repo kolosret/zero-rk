@@ -282,11 +282,11 @@ void ZeroRKReactorManager::AssignGpuId() {
 
     //Determine which devices are visible to the currecnt rank
     int visDevice;
-    if(int_options_["verbosity"] > 0) {
+    // if(int_options_["verbosity"] > 0) {
         if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
             visDevice = atoi(getenv("ROCR_VISIBLE_DEVICES"));
         }
-    }
+    // }
     gpuVecLoc[rank] = visDevice;
 
     //Syncronize and communicate the visible devices to all the ranks
