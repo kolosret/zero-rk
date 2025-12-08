@@ -881,9 +881,19 @@ int ReactorNVectorSerialGpu::GetJacobianDense(double t, N_Vector y, N_Vector fy,
 int ReactorNVectorSerialGpu::GetJacobianDenseRaw(long int N, double t, N_Vector y, N_Vector fy, double* Jac)
 {
   if(int_options_["analytic"])  {
+//    double start_time = zerork::getHighResolutionTime();
     SetupJacobianSparseDevice(t,y,fy);
     hipMemset(Jac, 0, sizeof(double)*num_variables_*num_variables_*num_reactors_);
     SparseToDenseDevice(*jacobian_row_indexes_dev_ptr_, *jacobian_column_indexes_dev_ptr_, jacobian_data_dev_, Jac);
+//      hipError_t err = hipDeviceSynchronize();   // NOTE: hipError_t (no space, no 'e')
+//      if (err != hipSuccess) {
+//          fprintf(stderr, "HIP error %d after solve: %s\n",
+//                  err, hipGetErrorString(err));
+//      }
+//    double jacobian_setup_time = zerork::getHighResolutionTime() - start_time;
+//
+//    std::cout << ""
+//         << jacobian_setup_time << " JacevalDevice" << endl;
   } else {
     this->DividedDifferenceJacobian(t, y, fy, Jac);
   }
@@ -946,6 +956,7 @@ int ReactorNVectorSerialGpu::JacobianFactor(realtype gamma)
   int flag;
   assert(jac_setup_);
   if(int_options_["dense"] == 1) {
+      double start_time =zerork::getHighResolutionTime();
     dense_preconditioner_dev_.resize(num_reactors_*num_variables_*num_variables_);
     //TODO: Fuse all of these into a single kernel
     thrust::fill(dense_preconditioner_dev_.begin(), dense_preconditioner_dev_.end(), -gamma);
@@ -957,6 +968,15 @@ int ReactorNVectorSerialGpu::JacobianFactor(realtype gamma)
     // compute M = 1.0 - gamma*numerical_jacobian
     AddConstantBlockDiagonal(num_variables_, num_reactors_, 1.0, thrust::raw_pointer_cast(&dense_preconditioner_dev_[0]));
     flag = hip_la_manager_->factor(num_reactors_, num_variables_, thrust::raw_pointer_cast(&dense_preconditioner_dev_[0]));
+      hipError_t err = hipDeviceSynchronize();   // NOTE: hipError_t (no space, no 'e')
+      if (err != hipSuccess) {
+          fprintf(stderr, "HIP error %d after solve: %s\n",
+                  err, hipGetErrorString(err));
+      }
+    double jfactor_time = zerork::getHighResolutionTime() - start_time;
+
+      std::cout << ""
+                << jfactor_time << " factorDevice" << endl;
   } else {
 #if HIP_VERSION > (5*10000000 + 6*100000)
     //TODO: Sparse numeric
@@ -1019,7 +1039,17 @@ int ReactorNVectorSerialGpu::JacobianSolve(double t, N_Vector y, N_Vector fy,
   double * z_ptr = N_VGetDeviceArrayPointer_Hip(z);
   int flag = 0;
   if(int_options_["dense"] == 1) {
+      double start_time = zerork::getHighResolutionTime();
     flag = hip_la_manager_->solve(num_reactors_, num_variables_, r_ptr, z_ptr);
+
+      hipError_t err = hipDeviceSynchronize();   // NOTE: hipError_t (no space, no 'e')
+      if (err != hipSuccess) {
+          fprintf(stderr, "HIP error %d after solve: %s\n",
+                  err, hipGetErrorString(err));
+      }
+      double jsolve_time = zerork::getHighResolutionTime() - start_time;
+      std::cout << ""
+                << jsolve_time << " solveDevice" << endl;
   } else {
 #if HIP_VERSION > (5*10000000 + 6*100000)
     flag = hsrfm_ptr_->solve(num_reactors_, num_variables_, r_ptr, z_ptr);

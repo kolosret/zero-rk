@@ -10,21 +10,21 @@
 
 class CvodeSolver : public SolverBase
 {
- public:
-  CvodeSolver(ReactorBase& reactor);
-  ~CvodeSolver() {};
+public:
+    CvodeSolver(ReactorBase& reactor);
+    ~CvodeSolver() {};
 
-  int Integrate(const double end_time);
-  int Iterative();
+    int Integrate(const double end_time,std::vector<int>* param);
+    int Iterative();
 
-  void SetCallbackFunction(zerork_callback_fn fn, void* cb_fn_data);
+    void SetCallbackFunction(zerork_callback_fn fn, void* cb_fn_data);
 
- private:
-  ReactorBase& reactor_ref_;
-  void AdjustWeights(void* cvode_mem);
+private:
+    ReactorBase& reactor_ref_;
+    void AdjustWeights(void* cvode_mem);
 
-  zerork_callback_fn cb_fn_;
-  void* cb_fn_data_;
+    zerork_callback_fn cb_fn_;
+    void* cb_fn_data_;
 };
 
 #endif

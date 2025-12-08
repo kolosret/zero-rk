@@ -12,7 +12,7 @@ class SolverBase : public Optionable
   SolverBase(ReactorBase& reactor) {};
   virtual ~SolverBase() {};
 
-  virtual int Integrate(const double time) = 0;
+  virtual int Integrate(const double time, std::vector<int>* param) = 0;
   virtual int Iterative() = 0;
 
   virtual void SetCallbackFunction(zerork_callback_fn fn, void* user_data) = 0;

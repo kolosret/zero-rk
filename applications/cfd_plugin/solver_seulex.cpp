@@ -21,7 +21,7 @@ SeulexSolver::SeulexSolver(ReactorBase& reactor)
       cb_fn_data_(nullptr)
 {}
 
-int SeulexSolver::Integrate(const double end_time) {
+int SeulexSolver::Integrate(const double end_time, std::vector<int>* param) {
   N_Vector& state = reactor_ref_.GetStateNVectorRef();
   int num_variables = reactor_ref_.GetNumStateVariables();
   int num_batches = reactor_ref_.GetNumBatchReactors();

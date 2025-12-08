@@ -4,11 +4,14 @@
 #include "zerork/mechanism_cuda.h"
 #include "reactor_nvector_serial_gpu.h"
 
+#include <memory>
 class ReactorConstantVolumeGPU : public ReactorNVectorSerialGpu
 {
  public:
   ReactorConstantVolumeGPU(std::shared_ptr<zerork::mechanism_cuda> mech_ptr);
   ~ReactorConstantVolumeGPU();
+
+
 
   void InitializeState(const double reactor_time,
                        const int n_reactors,
@@ -33,6 +36,8 @@ class ReactorConstantVolumeGPU : public ReactorNVectorSerialGpu
   int RootFunction(double t, N_Vector y, double *root_function);
 
   int GetNumRootFunctions();
+
+
 };
 
 #endif

@@ -46,8 +46,8 @@ struct _ZRKLinearSolverContent_MagmaDense {
   SUNMemoryHelper memhelp;
   magma_queue_t   q;
   SUNMatrix       Ainv;
+  booleantype     use_lu;
 };
-
 typedef struct _ZRKLinearSolverContent_MagmaDense *ZRKLinearSolverContent_MagmaDense;
 
 

@@ -14,7 +14,7 @@ class SeulexSolver : public SolverBase
   SeulexSolver(ReactorBase& reactor);
   ~SeulexSolver() {};
 
-  int Integrate(const double end_time);
+  int Integrate(const double end_time, std::vector<int>* param);
   int Iterative() { return 0; };
 
   void SetCallbackFunction(zerork_callback_fn fn, void* cb_fn_data);

@@ -60,6 +60,7 @@ ZeroRKReactorManager::ZeroRKReactorManager()
   int_options_["reactor_weight_mult"] = 1;
   int_options_["dump_reactors"] = 0;
   int_options_["dump_failed_reactors"] = 0;
+  int_options_["output_performance_log"] = 1;
 
   //Solver options
   int_options_["max_steps"] = 5000;
@@ -89,7 +90,7 @@ ZeroRKReactorManager::ZeroRKReactorManager()
 
   //GPU Options
   int_options_["gpu"] = 0;
-  int_options_["initial_gpu_multiplier"] = 8;
+  int_options_["initial_gpu_multiplier"] = 80;
   int_options_["n_reactors_min"] = 128;
   int_options_["n_reactors_max"] = 1024;
 
@@ -180,6 +181,7 @@ zerork_status_t ZeroRKReactorManager::ReadOptionsFile(const std::string& options
 #endif
   int_options_["dump_reactors"] = inputFileDB.dump_reactors();
   int_options_["dump_failed_reactors"] = inputFileDB.dump_failed_reactors();
+//    int_options_["output_performance_log"] = inputFileDB.output_performance_log();
 
   string_options_["reactor_timing_log_filename"] = inputFileDB.reactor_timing_log();
   string_options_["mechanism_parsing_log_filename"] = inputFileDB.mechanism_parsing_log();
@@ -280,7 +282,7 @@ void ZeroRKReactorManager::AssignGpuId() {
     std::vector<int> gpuVecLoc(nprocs, -1);
     std::vector<int> gpuVec(nprocs, -1);
 
-    //Determine which devices are visible to the currecnt rank
+    //Determine which devices are visible to the current rank
     int visDevice;
     // if(int_options_["verbosity"] > 0) {
         if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
@@ -669,6 +671,13 @@ zerork_status_t ZeroRKReactorManager::FinishInit() {
       reactor_log_file_ << std::setw(17) << "n_steps_avg";
       reactor_log_file_ << std::setw(17) << "n_steps_avg_cpu";
       reactor_log_file_ << std::setw(17) << "n_steps_avg_gpu";
+        reactor_log_file_ << std::setw(17) << "NumRhsEvals";
+        reactor_log_file_ << std::setw(17) << "NumLinSolvSetup";
+        reactor_log_file_ << std::setw(17) << "NumLinRhsEvals";
+        reactor_log_file_ << std::setw(17) << "NumJacEvals";
+        reactor_log_file_ << std::setw(17) << "NonlinSolvIters";
+        reactor_log_file_ << std::setw(17) << "NlinSolConvFail";
+        reactor_log_file_ << std::setw(17) << "NumErrTestFails";
       reactor_log_file_ << std::setw(17) << "max_time_cpu";
       reactor_log_file_ << std::setw(17) << "max_time_gpu";
       reactor_log_file_ << std::setw(17) << "step_time_cpu";
@@ -886,6 +895,15 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
   n_gpu_solve_ = 0;
   n_gpu_solve_no_temperature_ = 0;
 
+    //dont forget to set these to  0...
+    n_fe_ = 0;
+    n_setups_ = 0;
+    n_feLS_ = 0;
+    n_je_ = 0;
+    n_ni_ = 0;
+    n_cfn_ = 0;
+    n_etf_ = 0;
+
   int always_solve_temp = int_options_["always_solve_temperature"];
 
   int n_reactors_self_calc = n_reactors_self_ + n_reactors_other_;
@@ -946,7 +964,7 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
       DumpReactor("pre", j, *T_ptrs[j], *P_ptrs[j], *rc_ptrs[j], *rg_ptrs[j], mf_ptrs[j]);
     }
   }
-
+    std::vector<int>solve_param(7,0);
 #ifdef ZERORK_GPU
   if(int_options_["gpu"] != 0 && rank_has_gpu_[rank_]) {
     //Instantiate reactors on first call, after options are set
@@ -1047,15 +1065,24 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
         }
         reactor_gpu_ptr_->InitializeState(0.0, n_curr, &T_gpu[0], &P_gpu[0],
                                           &mf_gpu[0], dpdt_ptr, e_src_ptr, y_src_ptr);
-        nstep_reactors = solver->Integrate(dt_calc_);
+
+        nstep_reactors = solver->Integrate(dt_calc_, &solve_param);
+          double reactor_time = getHighResolutionTime() - start_time;
         reactor_gpu_ptr_->GetState(dt_calc_, &T_gpu[0], &P_gpu[0], &mf_gpu[0]);
 
-        double reactor_time = getHighResolutionTime() - start_time;
+
         sum_gpu_reactor_time_ += reactor_time;
 
         if(nstep_reactors >= 0) {
           n_steps_gpu_ += nstep_reactors*n_curr;
           n_gpu_solve_ += n_curr;
+            n_fe_ += solve_param[0]*n_curr;
+            n_setups_ += solve_param[1]*n_curr;
+            n_feLS_ += solve_param[2]*n_curr;
+            n_je_ += solve_param[3]*n_curr;
+            n_ni_ += solve_param[4]*n_curr;
+            n_cfn_ += solve_param[5]*n_curr;
+            n_etf_ += solve_param[6]*n_curr;
           if(!solve_temperature) n_gpu_solve_no_temperature_ += n_curr;
           for(int k = 0; k < n_curr; ++k) {
             int k_reactor = n_remaining - k - 1;
@@ -1147,7 +1174,7 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
                                     mf_ptrs[k], &dpdt_reactor,
                                     &e_src_reactor,
                                     y_src_reactor);
-      int nsteps = solver->Integrate(dt_calc_);
+      int nsteps = solver->Integrate(dt_calc_,&solve_param);
       double reactor_time = getHighResolutionTime() - start_time;
       if(nsteps < 0) {
         flag = ZERORK_STATUS_FAILED_SOLVE;
@@ -1159,6 +1186,13 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
         reactor_ptr_->GetState(dt_calc_, T_ptrs[k], P_ptrs[k], mf_ptrs[k]);
         *root_times_ptrs[k] = reactor_ptr_->GetRootTime();
         n_steps_cpu_ += nsteps;
+          n_fe_ += solve_param[0];
+          n_setups_ += solve_param[1];
+          n_feLS_ += solve_param[2];
+          n_je_ += solve_param[3];
+          n_ni_ += solve_param[4];
+          n_cfn_ += solve_param[5];
+          n_etf_ += solve_param[6];
         double temp_delta = *T_ptrs[k] - T_init;
         if(temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
         *temp_delta_ptrs[k] = temp_delta;
@@ -1313,116 +1347,150 @@ zerork_status_t ZeroRKReactorManager::PostSolve() {
 
 void ZeroRKReactorManager::ProcessPerformance()
 {
-  double all_time = sum_cpu_reactor_time_ + sum_gpu_reactor_time_;
-  double max_cpu_reactor_time = sum_cpu_reactor_time_;
-  double max_gpu_reactor_time = sum_gpu_reactor_time_;
+    printf("cpu reactor time: %g, and gpu reactor time: %g, on rank: rank%d\n",sum_cpu_reactor_time_,sum_gpu_reactor_time_,rank_);
+    double all_time = sum_cpu_reactor_time_ + sum_gpu_reactor_time_;
+    double max_cpu_reactor_time = sum_cpu_reactor_time_;
+    double max_gpu_reactor_time = sum_gpu_reactor_time_;
 
-  n_reactors_solved_ranks_[rank_] = n_cpu_solve_ + n_gpu_solve_;
-  all_time_ranks_[rank_] = all_time;
+    n_reactors_solved_ranks_[rank_] = n_cpu_solve_ + n_gpu_solve_;
+    all_time_ranks_[rank_] = all_time;
 #ifdef USE_MPI
-  if(nranks_ > 1) {
-    int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
-    MPI_Gather(&n_total_solved,1,MPI_INT,&n_reactors_solved_ranks_[0],1,MPI_INT,root_rank_,MPI_COMM_WORLD);
-    MPI_Gather(&all_time,1,MPI_DOUBLE,&all_time_ranks_[0],1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
-    // Collect timing/step count data
-    double rr; //reduced real
-    int ri; //reduced int
+    if(nranks_ > 1) {
+        int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
+        MPI_Gather(&n_total_solved,1,MPI_INT,&n_reactors_solved_ranks_[0],1,MPI_INT,root_rank_,MPI_COMM_WORLD);
+        MPI_Gather(&all_time,1,MPI_DOUBLE,&all_time_ranks_[0],1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
+        // Collect timing/step count data
+        double rr; //reduced real
+        int ri; //reduced int
 
-    MPI_Reduce(&n_cpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_cpu_solve_ = ri;
-    MPI_Reduce(&n_cpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_cpu_solve_no_temperature_ = ri;
-    MPI_Reduce(&n_gpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_solve_ = ri;
-    MPI_Reduce(&n_gpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_solve_no_temperature_ = ri;
-    MPI_Reduce(&n_gpu_groups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_groups_ = ri;
+        MPI_Reduce(&n_cpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cpu_solve_ = ri;
+        MPI_Reduce(&n_cpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cpu_solve_no_temperature_ = ri;
+        MPI_Reduce(&n_gpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_solve_ = ri;
+        MPI_Reduce(&n_gpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_solve_no_temperature_ = ri;
+        MPI_Reduce(&n_gpu_groups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_groups_ = ri;
 
-    MPI_Reduce(&n_steps_cpu_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_steps_cpu_ = ri;
-    MPI_Reduce(&n_steps_gpu_,&ri,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_steps_gpu_ = ri;
+        MPI_Reduce(&n_steps_cpu_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_steps_cpu_ = ri;
+        MPI_Reduce(&n_steps_gpu_,&ri,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_steps_gpu_ = ri;
 
-    //Get max time for cpu and gpu
-    MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) max_cpu_reactor_time = rr;
-    MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) max_gpu_reactor_time = rr;
-    //Calc per step times based on sum of times
-    MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) sum_cpu_reactor_time_ = rr;
-    MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) sum_gpu_reactor_time_ = rr;
-  } else {
-    max_cpu_reactor_time = sum_cpu_reactor_time_;
-    max_gpu_reactor_time = sum_gpu_reactor_time_;
-  }
+        MPI_Reduce(&n_fe_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_fe_ = ri;
+        MPI_Reduce(&n_setups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_setups_ = ri;
+        MPI_Reduce(&n_feLS_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_feLS_ = ri;
+        MPI_Reduce(&n_je_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_je_ = ri;
+        MPI_Reduce(&n_ni_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_ni_ = ri;
+        MPI_Reduce(&n_cfn_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cfn_ = ri;
+        MPI_Reduce(&n_etf_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_etf_ = ri;
+
+
+        //Get max time for cpu and gpu
+        MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) max_cpu_reactor_time = rr;
+        MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) max_gpu_reactor_time = rr;
+        //Calc per step times based on sum of times
+        MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) sum_cpu_reactor_time_ = rr;
+        MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) sum_gpu_reactor_time_ = rr;
+    } else {
+        max_cpu_reactor_time = sum_cpu_reactor_time_;
+        max_gpu_reactor_time = sum_gpu_reactor_time_;
+    }
 #else
-  max_cpu_reactor_time = sum_cpu_reactor_time_;
+    max_cpu_reactor_time = sum_cpu_reactor_time_;
   max_gpu_reactor_time = sum_gpu_reactor_time_;
 #endif
-  if(rank_ == root_rank_) {
-    int n_steps_total = n_steps_cpu_ + n_steps_gpu_;
-    int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
-    double nstep_avg = n_total_solved > 0 ? n_steps_total/n_total_solved : 0;
+    if(rank_ == root_rank_) {
+        int n_steps_total = n_steps_cpu_ + n_steps_gpu_;
+        int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
+        double nstep_avg = n_total_solved > 0 ? n_steps_total/n_total_solved : 0;
 
-    double nstep_avg_gpu = n_gpu_solve_ > 0 ? n_steps_gpu_/n_gpu_solve_ : 0;
-    double nstep_avg_cpu = n_cpu_solve_ > 0 ? n_steps_cpu_/n_cpu_solve_ : 0;
+        double nstep_avg_gpu = n_gpu_solve_ > 0 ? n_steps_gpu_/n_gpu_solve_ : 0;
+        double nstep_avg_cpu = n_cpu_solve_ > 0 ? n_steps_cpu_/n_cpu_solve_ : 0;
 
-    double cpu_per_step_time = n_cpu_solve_ > 0 ? sum_cpu_reactor_time_/n_steps_cpu_ : 0;
-    double gpu_per_step_time = n_gpu_solve_ > 0 ? sum_gpu_reactor_time_/n_steps_gpu_ : 0;
+        double fe_avg = n_total_solved > 0 ? n_fe_/n_total_solved : 0;
+        double setups_avg = n_total_solved > 0 ? n_setups_/n_total_solved : 0;
+        double feLS_avg = n_total_solved > 0 ? n_feLS_/n_total_solved : 0;
+        double je_avg = n_total_solved > 0 ? n_je_/n_total_solved : 0;
+        double ni_avg = n_total_solved > 0 ? n_ni_/n_total_solved : 0;
+        double cfn_avg = n_total_solved > 0 ? n_cfn_/n_total_solved : 0;
+        double etf_avg = n_total_solved > 0 ? n_etf_/n_total_solved : 0;
 
-    double avg_time = 0.0;
-    double max_time = 0.0;
-    double total_time = 0.0;
-    for(int i = 0; i < nranks_; ++i) {
-       max_time = std::max(max_time,all_time_ranks_[i]);
-       total_time += all_time_ranks_[i];
-    }
-    avg_time = total_time/nranks_;
-    avg_reactor_time_ = n_total_solved > 0 ? avg_time/n_total_solved : 1.0;
+        double cpu_per_step_time = n_cpu_solve_ > 0 ? sum_cpu_reactor_time_/n_steps_cpu_ : 0;
+        double gpu_per_step_time = n_gpu_solve_ > 0 ? sum_gpu_reactor_time_/n_steps_gpu_ : 0;
 
-    //Print stats to file
-    //reactor_log_file_ << std::setprecision(16);
-    reactor_log_file_ << std::setw(13) <<  n_cycle_;
-    reactor_log_file_ << std::setw(17) <<  n_total_solved;
-    reactor_log_file_ << std::setw(17) <<  n_cpu_solve_;
-    reactor_log_file_ << std::setw(17) <<  n_cpu_solve_no_temperature_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_solve_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_solve_no_temperature_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_groups_;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg_cpu;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg_gpu;
-    reactor_log_file_ << std::setw(17) <<  max_cpu_reactor_time;
-    reactor_log_file_ << std::setw(17) <<  max_gpu_reactor_time;
-    reactor_log_file_ << std::setw(17) <<  cpu_per_step_time;
-    reactor_log_file_ << std::setw(17) <<  gpu_per_step_time;
-    reactor_log_file_ << std::setw(17) <<  avg_time;
-    reactor_log_file_ << std::setw(17) <<  max_time;
-    reactor_log_file_ << std::endl;
-    reactor_log_file_.flush();
-
-    if(int_options_["verbosity"] > 0) {
-      if(int_options_["load_balance"]) {
-        double wasted_time = max_time - avg_time;
+        double avg_time = 0.0;
+        double max_time = 0.0;
+        double total_time = 0.0;
         for(int i = 0; i < nranks_; ++i) {
-          printf("Rank %d calculated %d reactors in %f seconds.\n",i,n_reactors_solved_ranks_[i],all_time_ranks_[i]);
+            max_time = std::max(max_time,all_time_ranks_[i]);
+            total_time += all_time_ranks_[i];
         }
-        printf("Max Time, Avg Time, Wasted Time = %f, %f, %f\n",max_time,avg_time,wasted_time);
-      } else {
-        printf("Rank %d calculated %d reactors in %f seconds.\n",rank_,n_cpu_solve_+n_gpu_solve_,all_time_ranks_[rank_]);
-      }
+        avg_time = total_time/nranks_;
+        avg_reactor_time_ = n_total_solved > 0 ? avg_time/n_total_solved : 1.0;
+
+        //Print stats to file
+        //reactor_log_file_ << std::setprecision(16);
+        reactor_log_file_ << std::setw(13) <<  n_cycle_;
+        reactor_log_file_ << std::setw(17) <<  n_total_solved;
+        reactor_log_file_ << std::setw(17) <<  n_cpu_solve_;
+        reactor_log_file_ << std::setw(17) <<  n_cpu_solve_no_temperature_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_solve_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_solve_no_temperature_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_groups_;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg_cpu;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg_gpu;
+        reactor_log_file_ << std::setw(17) <<  fe_avg;
+        reactor_log_file_ << std::setw(17) <<  setups_avg;
+        reactor_log_file_ << std::setw(17) <<  feLS_avg;
+        reactor_log_file_ << std::setw(17) <<  je_avg;
+        reactor_log_file_ << std::setw(17) <<  ni_avg;
+        reactor_log_file_ << std::setw(17) <<  cfn_avg;
+        reactor_log_file_ << std::setw(17) <<  etf_avg;
+        reactor_log_file_ << std::setw(17) <<  max_cpu_reactor_time;
+        reactor_log_file_ << std::setw(17) <<  max_gpu_reactor_time;
+        reactor_log_file_ << std::setw(17) <<  cpu_per_step_time;
+        reactor_log_file_ << std::setw(17) <<  gpu_per_step_time;
+        reactor_log_file_ << std::setw(17) <<  avg_time;
+        reactor_log_file_ << std::setw(17) <<  max_time;
+        reactor_log_file_ << std::endl;
+        reactor_log_file_.flush();
+
+        if(int_options_["verbosity"] > 0) {
+            if(int_options_["load_balance"]) {
+                double wasted_time = max_time - avg_time;
+                for(int i = 0; i < nranks_; ++i) {
+                    printf("Rank %d calculated %d reactors in %f seconds.\n",i,n_reactors_solved_ranks_[i],all_time_ranks_[i]);
+                }
+                printf("Max Time, Avg Time, Wasted Time = %f, %f, %f\n",max_time,avg_time,wasted_time);
+            } else {
+                printf("Rank %d calculated %d reactors in %f seconds.\n",rank_,n_cpu_solve_+n_gpu_solve_,all_time_ranks_[rank_]);
+            }
+        }
     }
-  }
 #ifdef USE_MPI
-  if(int_options_["load_balance"] == 2) {
-    MPI_Bcast(&avg_reactor_time_,1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
-  }
+    if(int_options_["load_balance"] == 2) {
+        MPI_Bcast(&avg_reactor_time_,1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
+    }
 #endif
-  //commTime += getHighResolutionTime() - startTime;
+    //commTime += getHighResolutionTime() - startTime;
 }
+
+
 
 
 #ifdef ZERORK_GPU
