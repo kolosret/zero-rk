@@ -320,16 +320,37 @@ void zerork_reactor(int inp_argc, char **inp_argv)
     printf("WARNING: nranks > 1 can not be used with option \"batched\" disabled.\n");
     printf("         Running in batched mode.\n");
   }
+
+
+
+
+    zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
     startTime=getHighResolutionTime();
   zerork_status_t flag = ZERORK_STATUS_SUCCESS;
   int num_solution_failures = 0;
   double t = 0;
   double dt= tend/n_steps;
   for(int i = 0; i < n_steps; ++i) {
+
+      if(i==0){
+      if (nReactors == 10) {
+          const double w10[10] = { 90.0,100.0,  80.0, 70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0 };
+          for (int k = 0; k < 10; ++k) reactorCost[k] = w10[k];
+          zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
+      }}else{if (nReactors == 10) {
+              const double w10[10] = { 90.0,  80.0, 100.0,70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0 };
+              for (int k = 0; k < 10; ++k) reactorCost[k] = w10[k];
+              zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
+          }
+
+      }
+
       if(!inputFileDB.batched() && nranks == 1) {
 #ifdef USE_OMP
         #pragma omp parallel for reduction(+:num_solution_failures)
 #endif
+
+
         for(int k = 0; k < nReactors; ++k) {
             ud.nsteps = 0;
             ud.time = 0.0;
@@ -349,6 +370,8 @@ void zerork_reactor(int inp_argc, char **inp_argv)
             if(inputFileDB.y_src() != 0.0) {
                 zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_Y_SRC, &reactorYsrc[k*nSpc], zrm_handle);
             }
+
+
 
             flag = zerork_reactor_solve(i, t, dt, 1, &reactorT[k], &reactorP[k],
                                         &reactorMassFrac[k*nSpc], zrm_handle);

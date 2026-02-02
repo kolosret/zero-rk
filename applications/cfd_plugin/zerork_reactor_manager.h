@@ -49,6 +49,7 @@ class ZeroRKReactorManager : public ZeroRKReactorManagerBase
   std::shared_ptr<zerork::mechanism_cuda> mech_cuda_ptr_;
 #endif
 
+
   int n_reactors_self_;
   int n_reactors_other_;
 
@@ -146,6 +147,62 @@ class ZeroRKReactorManager : public ZeroRKReactorManagerBase
   std::unique_ptr<ReactorBase> reactor_gpu_ptr_;
   void AssignGpuId();
   void UpdateRankWeights();
+
+
+
+    int batch_per_gpu_;
+    std::vector<int> reactor_to_rank_global_;
+    std::vector<int> reactor_to_batch_global_;
+    std::vector<int> reactor_to_rank_local_;
+    std::vector<int> reactor_to_batch_local_;
+
+    struct BinInfo {
+        int start_idx;
+        int end_idx;
+        int target_rank;
+        int batch_id;
+    };
+
+    std::vector<int> ComputeBinSizesMinimax(
+            const std::vector<double>& weights_sorted,
+            int num_bins,
+            int max_iter = 70);
+  std::vector<int> ComputeBinSizesMinimax_New(
+      const std::vector<double>& weights_sorted,
+      int num_bins,
+      int max_iter=70);
+
+      double PenaltyPiecewiseLinear(
+        int B,
+        const std::vector<int>& xB,
+        const std::vector<double>& yP);
+
+    void ResizeBinSizesWithPenalty(
+        std::vector<int>& sizes,
+        int n_total,
+        const std::vector<int>& xB_fit,
+        const std::vector<double>& p_fit,
+        int min_size,
+        double relax);
+
+
+
+  std::vector<std::pair<int,int>> PartitionUnderT_RMS(
+      const std::vector<double>& w_sorted, double T);
+    void ComputeGPUBinPartitioning(const std::vector<double>& weights_sorted,
+                                   const std::vector<int>& sort_order,
+                                   int num_bins,
+                                   std::vector<BinInfo>& bins);
+
+    std::vector<std::pair<int,int>> PartitionUnderT(
+            const std::vector<double>& w_sorted, double T);
+
+//std::vector<int> ComputeBinSizesMinimax(
+//        const std::vector<double>& weights_sorted,
+//        int num_bins,
+//        int max_iter);
+
+
 #endif
 
   static const int EXCHANGE_SEND_TAG_ = 42;
