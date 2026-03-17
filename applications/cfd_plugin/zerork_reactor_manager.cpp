@@ -36,6 +36,7 @@ ZeroRKReactorManager::ZeroRKReactorManager()
   //Non-optionable defaults
   load_balance_ = 1;
   load_balance_noise_ = 0;
+
   dump_reactors_ = false;
 
 #ifdef USE_MPI
