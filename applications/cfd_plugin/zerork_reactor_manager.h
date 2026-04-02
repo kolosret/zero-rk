@@ -49,6 +49,7 @@ class ZeroRKReactorManager : public ZeroRKReactorManagerBase
   std::shared_ptr<zerork::mechanism_cuda> mech_cuda_ptr_;
 #endif
 
+
   int n_reactors_self_;
   int n_reactors_other_;
 
@@ -107,20 +108,29 @@ class ZeroRKReactorManager : public ZeroRKReactorManagerBase
   std::vector<double> temp_delta_default_;
 
   bool tried_init_;
-  int n_calls_;
-  int n_cycle_;
-  int n_gpu_solve_;
-  int n_gpu_solve_no_temperature_;
-  int n_cpu_solve_;
-  int n_cpu_solve_no_temperature_;
-  int n_steps_cpu_;
-  int n_steps_gpu_;
-  int n_gpu_groups_;
-  int n_weight_updates_;
-  double gpu_multiplier_;
-  double sum_cpu_reactor_time_;
-  double sum_gpu_reactor_time_;
-  double avg_reactor_time_;
+    int n_calls_;
+    int n_cycle_;
+    int n_gpu_solve_;
+    int n_gpu_solve_no_temperature_;
+    int n_cpu_solve_;
+    int n_cpu_solve_no_temperature_;
+    int n_steps_cpu_;
+    int n_fe_;
+    int n_setups_;
+    int n_feLS_;
+    int n_je_;
+    int n_ni_;
+    int n_cfn_;
+    int n_etf_;
+    int n_steps_gpu_;
+    int n_gpu_groups_;
+    int n_weight_updates_;
+    int n_reactors_min_;
+    int n_reactors_max_;
+    double gpu_multiplier_;
+    double sum_cpu_reactor_time_;
+    double sum_gpu_reactor_time_;
+    double avg_reactor_time_;
   std::vector<double> rank_weights_;
   std::vector<int> n_reactors_solved_ranks_;
   std::vector<double> all_time_ranks_;
@@ -137,6 +147,62 @@ class ZeroRKReactorManager : public ZeroRKReactorManagerBase
   std::unique_ptr<ReactorBase> reactor_gpu_ptr_;
   void AssignGpuId();
   void UpdateRankWeights();
+
+
+
+    int batch_per_gpu_;
+    std::vector<int> reactor_to_rank_global_;
+    std::vector<int> reactor_to_batch_global_;
+    std::vector<int> reactor_to_rank_local_;
+    std::vector<int> reactor_to_batch_local_;
+
+    struct BinInfo {
+        int start_idx;
+        int end_idx;
+        int target_rank;
+        int batch_id;
+    };
+
+    std::vector<int> ComputeBinSizesMinimax(
+            const std::vector<double>& weights_sorted,
+            int num_bins,
+            int max_iter = 70);
+  std::vector<int> ComputeBinSizesMinimax_New(
+      const std::vector<double>& weights_sorted,
+      int num_bins,
+      int max_iter=70);
+
+      double PenaltyPiecewiseLinear(
+        int B,
+        const std::vector<int>& xB,
+        const std::vector<double>& yP);
+
+    void ResizeBinSizesWithPenalty(
+        std::vector<int>& sizes,
+        int n_total,
+        const std::vector<int>& xB_fit,
+        const std::vector<double>& p_fit,
+        int min_size,
+        double relax);
+
+
+
+  std::vector<std::pair<int,int>> PartitionUnderT_RMS(
+      const std::vector<double>& w_sorted, double T);
+    void ComputeGPUBinPartitioning(const std::vector<double>& weights_sorted,
+                                   const std::vector<int>& sort_order,
+                                   int num_bins,
+                                   std::vector<BinInfo>& bins);
+
+    std::vector<std::pair<int,int>> PartitionUnderT(
+            const std::vector<double>& w_sorted, double T);
+
+//std::vector<int> ComputeBinSizesMinimax(
+//        const std::vector<double>& weights_sorted,
+//        int num_bins,
+//        int max_iter);
+
+
 #endif
 
   static const int EXCHANGE_SEND_TAG_ = 42;

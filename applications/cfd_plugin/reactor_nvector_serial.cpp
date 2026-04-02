@@ -284,9 +284,14 @@ int ReactorNVectorSerial::GetJacobianDense(long int N, double t, N_Vector y, N_V
 int ReactorNVectorSerial::GetJacobianDense(double t, N_Vector y, N_Vector fy,
                                                SUNMatrix Jac)
 {
+//    double start_time = zerork::getHighResolutionTime();
   SetupJacobianSparse(t,y,fy);
   int flag = SparseToDense(Jac);
+//    double jacobian_setup_time = zerork::getHighResolutionTime() - start_time;
+//    std::cout << ""
+//              << jacobian_setup_time << " JacevalHost" << endl;
   return flag;
+
 }
 #else
 #error "Unsupported SUNDIALS version"
@@ -357,7 +362,7 @@ int ReactorNVectorSerial::JacobianFactor(double gamma)
   if( !dense_numeric ) {
     mismatch = FormPreconditioner(gamma);
   }
-
+//  double start_time =zerork::getHighResolutionTime();
   int flag = 0;
   if(int_options_["dense"] == 1) {
     if(int_options_["analytic"] == 1) {
@@ -388,6 +393,9 @@ int ReactorNVectorSerial::JacobianFactor(double gamma)
                           superlu_manager::CSC);
     }
   }
+//    double jfactor_time = zerork::getHighResolutionTime() - start_time;
+//    std::cout << ""
+//              << jfactor_time << " factorHost" << endl;
   return flag;
 }
 
@@ -475,6 +483,7 @@ int ReactorNVectorSerial::FormPreconditioner(double gamma)
 int ReactorNVectorSerial::JacobianSolve(double t, N_Vector y, N_Vector fy,
                                             N_Vector r, N_Vector z)
 {
+//  double start_time = zerork::getHighResolutionTime();
   double * r_ptr = NV_DATA_S(r);
   double * z_ptr = NV_DATA_S(z);
   int flag = 0;
@@ -483,6 +492,9 @@ int ReactorNVectorSerial::JacobianSolve(double t, N_Vector y, N_Vector fy,
   } else {
     flag = slum_.solve(num_variables_, r_ptr, z_ptr);
   }
+//    double jsolve_time = zerork::getHighResolutionTime() - start_time;
+//    std::cout << ""
+//              << jsolve_time << " solveHost" << endl;
   return flag;
 }
 

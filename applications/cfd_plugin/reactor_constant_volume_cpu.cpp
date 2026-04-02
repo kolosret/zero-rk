@@ -65,7 +65,7 @@ int ReactorConstantVolumeCPU::GetTimeDerivative(const double reactor_time,
                                                 N_Vector state,
                                                 N_Vector derivative)
 {
-  //double startTime=getHighResolutionTime();
+//  double startTime=zerork::getHighResolutionTime();
   double * y_ptr = NV_DATA_S(state);
   double * ydot_ptr = NV_DATA_S(derivative);
   double * net_production_rates_ptr = &(net_production_rates_[0]);
@@ -123,7 +123,10 @@ int ReactorConstantVolumeCPU::GetTimeDerivative(const double reactor_time,
                    y_ptr[num_spec] / mean_cx_mass_;
     ydot_ptr[num_spec]= dT_dt + (e_src_ + dpdt_*current_inverse_density) / (mean_cx_mass_*reference_temperature);
   }
-
+//    double endTime=zerork::getHighResolutionTime();
+//    double duration=endTime-startTime;
+//    std::cout << ""
+//              << duration<< " RHSHost " << endl;
   return 0;
 }
 

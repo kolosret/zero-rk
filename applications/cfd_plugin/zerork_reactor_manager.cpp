@@ -60,6 +60,7 @@ ZeroRKReactorManager::ZeroRKReactorManager()
   int_options_["reactor_weight_mult"] = 1;
   int_options_["dump_reactors"] = 0;
   int_options_["dump_failed_reactors"] = 0;
+  int_options_["output_performance_log"] = 1;
 
   //Solver options
   int_options_["max_steps"] = 5000;
@@ -89,7 +90,7 @@ ZeroRKReactorManager::ZeroRKReactorManager()
 
   //GPU Options
   int_options_["gpu"] = 0;
-  int_options_["initial_gpu_multiplier"] = 8;
+  int_options_["initial_gpu_multiplier"] = 80;
   int_options_["n_reactors_min"] = 128;
   int_options_["n_reactors_max"] = 1024;
 
@@ -127,7 +128,29 @@ ZeroRKReactorManager::ZeroRKReactorManager()
 
   cb_fn_ = nullptr;
   cb_fn_data_ = nullptr;
+
+#ifdef ZERORK_GPU
+    // Set batch_per_gpu from environment variable or default to 2
+    batch_per_gpu_ = 1;
+    if(getenv("ZERORK_BATCH_PER_GPU") != NULL) {
+        batch_per_gpu_ = atoi(getenv("ZERORK_BATCH_PER_GPU"));
+        if(batch_per_gpu_ < 1) {
+            batch_per_gpu_ = 1; // Fallback to default if invalid
+            if(rank_ == 0) {
+                printf("Warning: Invalid ZERORK_BATCH_PER_GPU value. Using default: 1\n");
+            }
+        }
+    }
+    if(rank_ == 0) {
+        printf("INFO: GPU batches per GPU set to: %d\n", batch_per_gpu_);
+    }
+#endif
+
+
 }
+
+
+
 
 zerork_status_t ZeroRKReactorManager::ReadOptionsFile(const std::string& options_filename) {
 
@@ -180,6 +203,7 @@ zerork_status_t ZeroRKReactorManager::ReadOptionsFile(const std::string& options
 #endif
   int_options_["dump_reactors"] = inputFileDB.dump_reactors();
   int_options_["dump_failed_reactors"] = inputFileDB.dump_failed_reactors();
+//    int_options_["output_performance_log"] = inputFileDB.output_performance_log();
 
   string_options_["reactor_timing_log_filename"] = inputFileDB.reactor_timing_log();
   string_options_["mechanism_parsing_log_filename"] = inputFileDB.mechanism_parsing_log();
@@ -238,18 +262,21 @@ zerork_status_t ZeroRKReactorManager::LoadMechanism() {
 
 #ifdef ZERORK_GPU
 //Auto-assigns based on node rank
-//Use CUDA_VISIBLE_DEVICES to choose/re-order
+
 void ZeroRKReactorManager::AssignGpuId() {
   if(gpu_id_ == -2) {
 #ifdef USE_MPI
     gpu_id_ = -1;
+      // Determine the rank number, number of ranks, and the names
     int rank, nprocs, namelen;
     char host_name[MPI_MAX_PROCESSOR_NAME] = "";
     MPI_Comm communicator = MPI_COMM_WORLD;
     MPI_Comm_rank(communicator, &rank);
     MPI_Comm_size(communicator, &nprocs);
+    if (rank==0) printf("The total number of processors %d. \n",nprocs);
     MPI_Get_processor_name(host_name,&namelen);
 
+    //Determine host names of the ranks
     std::vector<std::string> host_names(nprocs);
     host_names[rank] = host_name;
     for(int n=0; n<nprocs; n++) {
@@ -271,9 +298,51 @@ void ZeroRKReactorManager::AssignGpuId() {
     MPI_Comm_split(communicator, color, 0, &nodeComm);
     MPI_Comm_rank(nodeComm, &node_rank);
     MPI_Comm_free(&nodeComm);
+
+    //Get create a local and a global vector where the gpus visible to each rank are stored
+    //This works if job is launched wit --exclusive and --mpibind on with flux, which ensure the right binding
+    std::vector<int> gpuVecLoc(nprocs, -1);
+    std::vector<int> gpuVec(nprocs, -1);
+
+    //Determine which devices are visible to the current rank
+    int visDevice;
+    // if(int_options_["verbosity"] > 0) {
+        if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
+            visDevice = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        }
+    // }
+    gpuVecLoc[rank] = visDevice;
+
+    //Syncronize and communicate the visible devices to all the ranks
+    MPI_Barrier(communicator);
+    MPI_Allreduce(gpuVecLoc.data(), gpuVec.data(), nprocs, MPI_INT, MPI_MAX, communicator);
+    MPI_Bcast(gpuVec.data(), nprocs, MPI_INT, 0, communicator);
+
+    if(int_options_["verbosity"] > 3) {
+        std::cout << "Rank " << rank << " received vector: ";
+        for (int val : gpuVec) {
+            std::cout << val << " ";
+        }
+        std::cout << std::endl;
+    }
+
+    //Set the device to the host with the lowest rank
+    //Additional logic can be implemented here for oversubscription
+    bool assignGpu=true;
+    for(int i=0;i<rank;i++){
+        if (gpuVec[i]==visDevice){
+            assignGpu=false;
+            break;
+        }
+    }
+
+    if (assignGpu) gpu_id_=visDevice;
+//    printf("Set the device %d on node %s rank %d \n", gpu_id_, host_name, rank);
+
 #else
+
+   //Old way, assigning a adevice to multiple ranks, this section needs to be checked
    int node_rank = 0;
-#endif
 
     int ranks_per_gpu = 1;
     if(getenv("ZERORK_GPU_MPS_RANKS") != NULL) {
@@ -281,19 +350,32 @@ void ZeroRKReactorManager::AssignGpuId() {
     }
     /* Assign device to MPI process*/
     int n_devices;
+    // the output of this depends on the flux allocation
     hipGetDeviceCount(&n_devices);
+
+    if(int_options_["verbosity"] > 0) {
+        const char* path_var = std::getenv("ROCR_VISIBLE_DEVICES");
+        std::cout << "ROCR_VISIBLE_DEVICES: " << path_var << " on rank " << rank <<std::endl;
+    }
+
+    //This method doesnt ensure correct binding
     if(node_rank / n_devices < ranks_per_gpu) {
       gpu_id_ = node_rank % n_devices;
     }
+
     if(getenv("ROCR_VISIBLE_DEVICES") != NULL) {
-      if (rank==0) printf("Setting gpu id from ROCR_VISIBLE_DEVICES ...\n");
-      gpu_id_ = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        if (gpu_id_>=0) {
+            if (rank == 0) printf("Setting gpu id from ROCR_VISIBLE_DEVICES ...\n");
+            gpu_id_ = atoi(getenv("ROCR_VISIBLE_DEVICES"));
+        }
     }
+#endif
+
     if(gpu_id_ >= 0) {
 #ifdef USE_MPI
       printf("Assigning device %d to process on node %s rank %d \n", gpu_id_, host_name, rank);
 #else
-      printf("Assigning device %d to process\n", gpu_id_);
+      printf("Assigning device %d to process \n", gpu_id_);
 #endif
       hipSetDevice(gpu_id_);
       hipDeviceSynchronize();
@@ -611,6 +693,13 @@ zerork_status_t ZeroRKReactorManager::FinishInit() {
       reactor_log_file_ << std::setw(17) << "n_steps_avg";
       reactor_log_file_ << std::setw(17) << "n_steps_avg_cpu";
       reactor_log_file_ << std::setw(17) << "n_steps_avg_gpu";
+        reactor_log_file_ << std::setw(17) << "NumRhsEvals";
+        reactor_log_file_ << std::setw(17) << "NumLinSolvSetup";
+        reactor_log_file_ << std::setw(17) << "NumLinRhsEvals";
+        reactor_log_file_ << std::setw(17) << "NumJacEvals";
+        reactor_log_file_ << std::setw(17) << "NonlinSolvIters";
+        reactor_log_file_ << std::setw(17) << "NlinSolConvFail";
+        reactor_log_file_ << std::setw(17) << "NumErrTestFails";
       reactor_log_file_ << std::setw(17) << "max_time_cpu";
       reactor_log_file_ << std::setw(17) << "max_time_gpu";
       reactor_log_file_ << std::setw(17) << "step_time_cpu";
@@ -632,6 +721,557 @@ zerork_status_t ZeroRKReactorManager::FinishInit() {
   }
   return ZERORK_STATUS_SUCCESS;
 }
+
+
+#ifdef ZERORK_GPU
+
+
+// Greedy partition under threshold T for RMS cost:
+// cost(i..j) = sqrt( B * sum_{k=i..j} w_k^2 ), B = (j-i+1)
+std::vector<std::pair<int,int>> ZeroRKReactorManager::PartitionUnderT_RMS(
+        const std::vector<double>& w_sorted, double T)
+{
+    std::vector<std::pair<int,int>> bins;
+    const int n = (int)w_sorted.size();
+    if (n == 0) return bins;
+
+    // If T is non-positive, nothing fits => singletons
+    if (T <= 0.0) {
+        bins.reserve(n);
+        for (int i = 0; i < n; ++i) bins.emplace_back(i, i);
+        return bins;
+    }
+
+    int i = 0;
+    while (i < n) {
+        int start = i;
+        int end   = i;
+
+        double sumsq = w_sorted[i] * w_sorted[i];
+        int B = 1;
+
+        // If even singleton exceeds T (shouldn't happen if T >= max|w|), force singleton.
+        double cost = std::sqrt((double)B * sumsq);
+        if (cost > T) {
+            bins.emplace_back(i, i);
+            ++i;
+            continue;
+        }
+
+        // Extend while feasible
+        while ((end + 1) < n) {
+            const double wnext = w_sorted[end + 1];
+            const double sumsq2 = sumsq + wnext * wnext;
+            const int    B2     = B + 1;
+            const double cost2  = std::sqrt((double)B2 * sumsq2);
+
+            if (cost2 <= T) {
+                ++end;
+                sumsq = sumsq2;
+                B = B2;
+            } else {
+                break;
+            }
+        }
+
+        bins.emplace_back(start, end);
+        i = end + 1;
+    }
+
+    return bins;
+}
+
+
+
+double ZeroRKReactorManager::PenaltyPiecewiseLinear(
+        int B,
+        const std::vector<int>& xB,
+        const std::vector<double>& yP)
+{
+    const int m = (int)xB.size();
+    if (m == 0) return 1.0;
+    if (m == 1) return yP[0];
+
+    if (B <= xB[0])   return yP[0];
+    if (B >= xB[m-1]) return yP[m-1];
+
+    int k = 0;
+    while (k + 1 < m && B > xB[k + 1]) ++k;
+
+    const double x0 = (double)xB[k];
+    const double x1 = (double)xB[k + 1];
+    const double y0 = yP[k];
+    const double y1 = yP[k + 1];
+
+    const double t = ((double)B - x0) / (x1 - x0);
+    return y0 + t * (y1 - y0);
+}
+void ZeroRKReactorManager::ResizeBinSizesWithPenalty(
+        std::vector<int>& sizes,
+        int n_total,
+        const std::vector<int>& xB_fit,
+        const std::vector<double>& p_fit,
+        int min_size,
+        double relax)
+{
+    const int K = (int)sizes.size();
+    if (K == 0) return;
+
+    std::vector<double> weights(K, 0.0);
+    double wsum = 0.0;
+
+    for (int i = 0; i < K; ++i) {
+        int s = sizes[i];
+        if (s < min_size) s = min_size;
+        const double pen = PenaltyPiecewiseLinear(s, xB_fit, p_fit);
+        weights[i] = (double)s * pen;
+        wsum += weights[i];
+    }
+    if (wsum <= 0.0) return;
+
+    std::vector<double> blended(K, 0.0);
+    for (int i = 0; i < K; ++i) {
+        const double target = (double)n_total * (weights[i] / wsum);
+        blended[i] = (1.0 - relax) * (double)sizes[i] + relax * target;
+    }
+
+    std::vector<int> new_sizes(K, min_size);
+    std::vector<double> frac(K, 0.0);
+
+    int sum_int = 0;
+    for (int i = 0; i < K; ++i) {
+        int s = (int)std::floor(blended[i]);
+        if (s < min_size) s = min_size;
+        new_sizes[i] = s;
+        frac[i] = blended[i] - (double)s;
+        sum_int += s;
+    }
+
+    int delta = n_total - sum_int;
+
+    if (delta > 0) {
+        while (delta--) {
+            int best = 0;
+            for (int i = 1; i < K; ++i)
+                if (frac[i] > frac[best]) best = i;
+            new_sizes[best]++;
+            frac[best] = 0.0;
+        }
+    } else if (delta < 0) {
+        delta = -delta;
+        while (delta--) {
+            int best = -1;
+            double best_frac = 1e300;
+            for (int i = 0; i < K; ++i) {
+                if (new_sizes[i] > min_size && frac[i] < best_frac) {
+                    best = i;
+                    best_frac = frac[i];
+                }
+            }
+            if (best < 0) break;
+            new_sizes[best]--;
+        }
+    }
+
+    sizes.swap(new_sizes);
+}
+
+
+
+std::vector<int> ZeroRKReactorManager::ComputeBinSizesMinimax_New(
+        const std::vector<double>& weights_sorted,
+        int num_bins,
+        int max_iter)
+{
+    std::vector<int> sizes;
+    const int n = (int)weights_sorted.size();
+    if (n == 0 || num_bins <= 0) return sizes;
+
+    // If requesting >= n bins, every element is its own bin.
+    if (num_bins >= n) return std::vector<int>(n, 1);
+
+    // -------------------- ORIGINAL MINIMAX (UNCHANGED) --------------------
+    const double max_w = *std::max_element(weights_sorted.begin(), weights_sorted.end());
+    double T_lo = max_w;        // at least max_w * 1
+    double T_hi = max_w * n;    // at most max_w * n (single bin)
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        const double T_mid = 0.5 * (T_lo + T_hi);
+        auto bins_mid = PartitionUnderT(weights_sorted, T_mid);
+        if ((int)bins_mid.size() <= num_bins) T_hi = T_mid;
+        else                                  T_lo = T_mid;
+    }
+
+    auto bins = PartitionUnderT(weights_sorted, T_hi);
+
+    // If we got fewer than num_bins, split the longest bins until count matches.
+    while ((int)bins.size() < num_bins) {
+        int max_len = 0, max_idx = 0;
+        for (size_t k = 0; k < bins.size(); ++k) {
+            const int len = bins[k].second - bins[k].first + 1;
+            if (len > max_len) { max_len = len; max_idx = (int)k; }
+        }
+        const int i = bins[max_idx].first;
+        const int j = bins[max_idx].second;
+        if (i == j) break;
+        const int mid = (i + j) / 2;
+        bins[max_idx] = {i, mid};
+        bins.insert(bins.begin() + max_idx + 1, {mid + 1, j});
+    }
+
+    if ((int)bins.size() > num_bins) bins.resize(num_bins);
+
+    // -------------------- PRINT OLD BIN COSTS --------------------
+    std::printf("Minimax bin diagnostics (T* ~= %g):\n", T_hi);
+    for (size_t b = 0; b < bins.size(); ++b) {
+        const int i = bins[b].first;
+        const int j = bins[b].second;
+        const int len = j - i + 1;
+
+        double max_w_bin = weights_sorted[i];
+        for (int k = i + 1; k <= j; ++k) {
+            if (weights_sorted[k] > max_w_bin)
+                max_w_bin = weights_sorted[k];
+        }
+
+        const double cost = max_w_bin * double(len);
+
+        std::printf("  bin %zu: [%d,%d]  size=%d  max_w=%g  cost=max*size=%g\n",
+                    b, i, j, len, max_w_bin, cost);
+    }
+
+    // Convert bins to sizes
+    sizes.reserve(bins.size());
+    for (auto pr : bins) sizes.push_back(pr.second - pr.first + 1);
+
+    // -------------------- NEW: POST-RESIZE USING FITTED PENALTY --------------------
+    // Replace these points with your fitted penalty-vs-batch-size curve.
+    // The penalty should be > 1 for small bins if you want them to grow.
+    // If you also want very large bins to shrink, make penalty > 1 again at large B.
+
+    //v1
+//    const std::vector<int>    xB_fit = {0, 5000, 10000, 50000};
+//    const std::vector<double> p_fit  = {2.0,  1.0, 1.0, 0.25};
+
+    //v2
+    const std::vector<int>    xB_fit = {0, 250, 500,1000,2500, 5000, 10000, 50000};
+    const std::vector<double> p_fit  = {20.0, 5.4, 4.25, 1.8, 1.2, 1.0, 1.0, 0.25};
+
+    //v3
+//    const std::vector<int>    xB_fit = {0, 250, 500,1000,2500, 5000, 8800,  17700,  29200,  50000};
+//    const std::vector<double> p_fit  = {20.0, 10.4, 5.25, 3.5, 2.5, 1.0, 1/1.25,  1/3.96,   1/4.54,   1/9.0};
+
+    const int    min_size = 256; // prevent tiny batches (bandwidth not saturated)
+    const double relax    = 1.0; // 1.0 = full resize; try 0.5 for smoother timestep-to-timestep changes
+
+    // These are NON-static member helpers you added:
+    //   double PenaltyPiecewiseLinear(...);
+    //   void   ResizeBinSizesWithPenalty(...);
+    ResizeBinSizesWithPenalty(sizes, n, xB_fit, p_fit, min_size, relax);
+
+    // -------------------- PRINT RESIZED SIZES --------------------
+    std::printf("Resized bin sizes after penalty:\n");
+    int sumsz = 0;
+    for (size_t b = 0; b < sizes.size(); ++b) {
+        sumsz += sizes[b];
+        const double pen = PenaltyPiecewiseLinear(sizes[b], xB_fit, p_fit);
+        std::printf("  bin %zu: size=%d  penalty=%g\n", b, sizes[b], pen);
+    }
+    std::printf("  sum sizes = %d (n=%d)\n", sumsz, n);
+
+    return sizes;
+}
+
+
+
+
+std::vector<int> ZeroRKReactorManager::ComputeBinSizesMinimax(
+        const std::vector<double>& weights_sorted,
+        int num_bins,
+        int max_iter)
+{
+    std::vector<int> sizes;
+    const int n = (int)weights_sorted.size();
+    if (n == 0 || num_bins <= 0) return sizes;
+
+    if (num_bins >= n) return std::vector<int>(n, 1);
+
+    double max_w = *std::max_element(weights_sorted.begin(), weights_sorted.end());
+    double T_lo = max_w;
+    double T_hi = max_w * n;
+
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double T_mid = 0.5 * (T_lo + T_hi);
+        auto bins_mid = PartitionUnderT(weights_sorted, T_mid);
+        if ((int)bins_mid.size() <= num_bins) T_hi = T_mid;
+        else                                  T_lo = T_mid;
+    }
+
+    auto bins = PartitionUnderT(weights_sorted, T_hi);
+
+    while ((int)bins.size() < num_bins) {
+        int max_len = 0, max_idx = 0;
+        for (size_t k = 0; k < bins.size(); ++k) {
+            int len = bins[k].second - bins[k].first + 1;
+            if (len > max_len) { max_len = len; max_idx = (int)k; }
+        }
+        auto [i, j] = bins[max_idx];
+        if (i == j) break;
+        int mid = (i + j) / 2;
+        bins[max_idx] = {i, mid};
+        bins.insert(bins.begin() + max_idx + 1, {mid + 1, j});
+    }
+
+    if ((int)bins.size() > num_bins) bins.resize(num_bins);
+
+    // -------------------- PRINT BIN COSTS --------------------
+    printf("Minimax bin diagnostics (T* ~= %g):\n", T_hi);
+    for (size_t b = 0; b < bins.size(); ++b) {
+        int i = bins[b].first;
+        int j = bins[b].second;
+        int len = j - i + 1;
+
+        double max_w_bin = weights_sorted[i];
+        for (int k = i + 1; k <= j; ++k) {
+            if (weights_sorted[k] > max_w_bin)
+                max_w_bin = weights_sorted[k];
+        }
+
+        double cost = max_w_bin * double(len);
+
+        printf("  bin %zu: [%d,%d]  size=%d  max_w=%g  cost=max*size=%g\n",
+               b, i, j, len, max_w_bin, cost);
+    }
+
+
+    sizes.reserve(bins.size());
+    for (auto [i, j] : bins) sizes.push_back(j - i + 1);
+    return sizes;
+}
+
+std::vector<std::pair<int,int>> ZeroRKReactorManager::PartitionUnderT(
+        const std::vector<double>& w_sorted, double T)
+{
+    std::vector<std::pair<int,int>> bins;
+    const int n = (int)w_sorted.size();
+    if (n == 0) return bins;
+
+    // If T is non-positive, nothing can fit except (maybe) empty; return singletons.
+    if (T <= 0.0) {
+        bins.reserve(n);
+        for (int i = 0; i < n; ++i) bins.emplace_back(i, i);
+        return bins;
+    }
+
+    int i = 0;
+    while (i < n) {
+        const double wmax = w_sorted[i];
+
+
+        if (wmax > T) {
+            bins.emplace_back(i, i);
+            ++i;
+            continue;
+        }
+
+        int start = i;
+        int end   = i;
+        int count = 1;
+
+        // wmax * (count+1) <= T   (since max stays wmax under descending order)
+        while ((end + 1) < n) {
+            const int next_count = count + 1;
+            if (wmax * double(next_count) <= T) {
+                ++end;
+                count = next_count;
+            } else {
+                break;
+            }
+        }
+
+        bins.emplace_back(start, end);
+        i = end + 1;
+    }
+
+    return bins;
+}
+
+void ZeroRKReactorManager::ComputeGPUBinPartitioning(
+        const std::vector<double>& weights_sorted,
+        const std::vector<int>& sort_order,
+        int num_bins,
+        std::vector<BinInfo>& bins) {
+
+    int n = weights_sorted.size();
+    bins.clear();
+
+    if (n == 0) return;
+    if (num_bins <= 0) return;
+
+    // If num_bins >= n, each reactor is its own bin
+    if (num_bins >= n) {
+        for (int i = 0; i < n; ++i) {
+            BinInfo bin;
+            bin.start_idx = i;
+            bin.end_idx = i;
+            bins.push_back(bin);
+        }
+        // Assign to GPUs round-robin
+        for (size_t i = 0; i < bins.size(); ++i) {
+            bins[i].target_rank = i % n_gpu_ranks_;
+            bins[i].batch_id = (i / n_gpu_ranks_) % batch_per_gpu_;
+        }
+        return;
+    }
+
+    // Find max weight
+    double max_w = *std::max_element(weights_sorted.begin(), weights_sorted.end());
+
+    // Binary search bounds
+    double T_lo = max_w;  // Lower bound: at least max(w)
+    double T_hi = max_w * n;  // Upper bound: all in one bin
+
+    const int max_iter = 70;
+
+    // Binary search for smallest feasible T
+    for (int iter = 0; iter < max_iter; ++iter) {
+        double T_mid = 0.5 * (T_lo + T_hi);
+        auto bins_mid = PartitionUnderT(weights_sorted, T_mid);
+
+        if ((int)bins_mid.size() <= num_bins) {
+            T_hi = T_mid;
+        } else {
+            T_lo = T_mid;
+        }
+    }
+
+    // Get final bins with T_hi
+    auto final_bins = PartitionUnderT(weights_sorted, T_hi);
+
+    // Convert to BinInfo format
+    for (const auto& b : final_bins) {
+        BinInfo bin;
+        bin.start_idx = b.first;
+        bin.end_idx = b.second;
+        bins.push_back(bin);
+    }
+
+    // Split bins if we have fewer than num_bins
+    while ((int)bins.size() < num_bins) {
+        // Find bin with largest count
+        int max_len = 0;
+        int max_idx = 0;
+        for (size_t k = 0; k < bins.size(); ++k) {
+            int len = bins[k].end_idx - bins[k].start_idx + 1;
+            if (len > max_len) {
+                max_len = len;
+                max_idx = k;
+            }
+        }
+
+        // Can't split single-element bins
+        if (bins[max_idx].start_idx == bins[max_idx].end_idx) {
+            break;
+        }
+
+        // Split the largest bin
+        int mid = (bins[max_idx].start_idx + bins[max_idx].end_idx) / 2;
+        BinInfo new_bin;
+        new_bin.start_idx = mid + 1;
+        new_bin.end_idx = bins[max_idx].end_idx;
+        bins[max_idx].end_idx = mid;
+
+        bins.insert(bins.begin() + max_idx + 1, new_bin);
+    }
+
+    // Trim to exactly num_bins if we have more
+    if ((int)bins.size() > num_bins) {
+        bins.resize(num_bins);
+    }
+
+    // Assign bins to GPU ranks and batch IDs
+    // bins 0-1 -> rank with GPU 0, bins 2-3 -> rank with GPU 1, etc.
+    int batch_per_gpu = num_bins / n_gpu_ranks_;
+    for (size_t i = 0; i < bins.size(); ++i) {
+        int gpu_idx = i / batch_per_gpu;
+
+        // Find the rank that has this GPU
+        int gpu_rank = -1;
+        int gpu_count = 0;
+        for (int r = 0; r < nranks_; ++r) {
+            if (rank_has_gpu_[r]) {
+                if (gpu_count == gpu_idx) {
+                    gpu_rank = r;
+                    break;
+                }
+                gpu_count++;
+            }
+        }
+
+        bins[i].target_rank = gpu_rank;
+        bins[i].batch_id = i % batch_per_gpu;
+    }
+}
+
+//std::vector<int> ZeroRKReactorManager::ComputeBinSizesMinimax(
+//        const std::vector<double>& weights_sorted,
+//        int num_bins,
+//        int max_iter)
+//{
+//    std::vector<int> sizes;
+//    const int n = (int)weights_sorted.size();
+//    if (n <= 0 || num_bins <= 0) return sizes;
+//
+//    if (num_bins >= n) {
+//        return std::vector<int>(n, 1);
+//    }
+//
+//    double max_w = *std::max_element(weights_sorted.begin(), weights_sorted.end());
+//    double T_lo = max_w;
+//    double T_hi = max_w * n;
+//
+//    for (int iter = 0; iter < max_iter; ++iter) {
+//        double T_mid = 0.5 * (T_lo + T_hi);
+//        auto bins_mid = PartitionUnderT(weights_sorted, T_mid);
+//        if ((int)bins_mid.size() <= num_bins) T_hi = T_mid;
+//        else                                  T_lo = T_mid;
+//    }
+//
+//    auto bins = PartitionUnderT(weights_sorted, T_hi);
+//
+//    // If fewer than num_bins, split largest bins (by count)
+//    while ((int)bins.size() < num_bins) {
+//        int max_len = 0;
+//        int max_idx = 0;
+//        for (size_t k = 0; k < bins.size(); ++k) {
+//            int len = bins[k].second - bins[k].first + 1;
+//            if (len > max_len) { max_len = len; max_idx = (int)k; }
+//        }
+//        auto [i, j] = bins[max_idx];
+//        if (i == j) break;
+//        int mid = (i + j) / 2;
+//        bins[max_idx] = {i, mid};
+//        bins.insert(bins.begin() + max_idx + 1, {mid + 1, j});
+//    }
+//
+//    // If more than num_bins, trim (rare in this flow)
+//    if ((int)bins.size() > num_bins) bins.resize(num_bins);
+//
+//    // Convert to sizes
+//    sizes.reserve(bins.size());
+//    for (auto [i, j] : bins) sizes.push_back(j - i + 1);
+//
+//    return sizes;
+//}
+
+
+#endif
+
+
+
+
+
+
 
 #ifndef USE_MPI
 zerork_status_t ZeroRKReactorManager::LoadBalance()
@@ -658,6 +1298,140 @@ zerork_status_t ZeroRKReactorManager::LoadBalance()
         int weighted = (int)(int_options_["reactor_weight_mult"]*rg_self_[k]/avg_reactor_time_);
         n_weighted_reactors += std::max(weighted,1);
     }
+  }else   if(int_options_["load_balance"] == 3) {
+#ifdef ZERORK_GPU
+      // Only GPU ranks participate in load balance 3 for now.
+
+
+      int total_reactors = 0;
+      std::vector<int> reactors_per_rank(nranks_);
+
+      // Gather reactor counts
+      MPI_Allgather(&n_reactors_self_, 1, MPI_INT,
+                    &reactors_per_rank[0], 1, MPI_INT, MPI_COMM_WORLD);
+
+      for(int i = 0; i < nranks_; ++i) {
+          total_reactors += reactors_per_rank[i];
+      }
+
+      if(total_reactors == 0) {
+          return ZERORK_STATUS_SUCCESS;
+      }
+
+      // Gather all weights on rank 0
+      std::vector<double> all_weights;
+      std::vector<int> recvcounts(nranks_);
+      std::vector<int> displs(nranks_);
+
+      for(int i = 0; i < nranks_; ++i) {
+          recvcounts[i] = reactors_per_rank[i];
+          displs[i] = (i == 0) ? 0 : displs[i-1] + recvcounts[i-1];
+      }
+
+      if(rank_ == root_rank_) {
+          all_weights.resize(total_reactors);
+      }
+
+      MPI_Gatherv(rc_self_, n_reactors_self_, MPI_DOUBLE,
+                  rank_ == root_rank_ ? &all_weights[0] : nullptr,
+                  &recvcounts[0], &displs[0], MPI_DOUBLE,
+                  root_rank_, MPI_COMM_WORLD);
+
+      // Compute partitioning on rank 0
+      if(rank_ == root_rank_) {
+          // Sort by weight (using weight as chi)
+          std::vector<int> sort_order(total_reactors);
+          std::iota(sort_order.begin(), sort_order.end(), 0);
+//          std::sort(sort_order.begin(), sort_order.end(),
+//                    [&all_weights](int i, int j) {
+//                        return all_weights[i] < all_weights[j];
+//                    });
+
+          std::sort(sort_order.begin(), sort_order.end(),
+                    [&all_weights](int i, int j) {
+                        return all_weights[i] > all_weights[j];  // descending (matches PartitionUnderT)
+                    });
+
+          // Create sorted weight vector
+          std::vector<double> weights_sorted(total_reactors);
+          for(int i = 0; i < total_reactors; ++i) {
+              weights_sorted[i] = all_weights[sort_order[i]];
+          }
+
+          // Compute bins
+          int num_bins = n_gpu_ranks_ * batch_per_gpu_;
+          std::vector<BinInfo> bins;
+          ComputeGPUBinPartitioning(weights_sorted, sort_order, num_bins, bins);
+
+          // Create global assignment vectors
+          reactor_to_rank_global_.resize(total_reactors);
+          reactor_to_batch_global_.resize(total_reactors);
+
+          // Fill in assignments based on bins
+          for(const auto& bin : bins) {
+              for(int i = bin.start_idx; i <= bin.end_idx; ++i) {
+                  int original_idx = sort_order[i];
+                  reactor_to_rank_global_[original_idx] = bin.target_rank;
+                  reactor_to_batch_global_[original_idx] = bin.batch_id;
+              }
+          }
+
+          if(int_options_["verbosity"] > 0) {
+              printf("\n=== GPU Load Balance (mode 3) ===\n");
+              printf("Total reactors: %d, Bins: %d, GPU ranks: %d\n",
+                     total_reactors, (int)bins.size(), n_gpu_ranks_);
+              for(size_t i = 0; i < bins.size(); ++i) {
+                  int bin_size = bins[i].end_idx - bins[i].start_idx + 1;
+                  double max_w = *std::max_element(
+                          weights_sorted.begin() + bins[i].start_idx,
+                          weights_sorted.begin() + bins[i].end_idx + 1);
+                  double cost = max_w * bin_size;
+                  printf("  Bin %zu: rank=%d batch=%d size=%d max_w=%.3e cost=%.3e\n",
+                         i, bins[i].target_rank, bins[i].batch_id,
+                         bin_size, max_w, cost);
+              }
+              printf("=================================\n\n");
+          }
+      }
+
+      // Broadcast global assignments to all ranks
+      if(rank_ == root_rank_) {
+          reactor_to_rank_global_.resize(total_reactors);
+          reactor_to_batch_global_.resize(total_reactors);
+      } else {
+          reactor_to_rank_global_.resize(total_reactors);
+          reactor_to_batch_global_.resize(total_reactors);
+      }
+
+      MPI_Bcast(&reactor_to_rank_global_[0], total_reactors, MPI_INT,
+                root_rank_, MPI_COMM_WORLD);
+      MPI_Bcast(&reactor_to_batch_global_[0], total_reactors, MPI_INT,
+                root_rank_, MPI_COMM_WORLD);
+
+      // Extract local assignments
+      reactor_to_rank_local_.resize(n_reactors_self_);
+      reactor_to_batch_local_.resize(n_reactors_self_);
+
+      int global_offset = displs[rank_];
+      for(int i = 0; i < n_reactors_self_; ++i) {
+          reactor_to_rank_local_[i] = reactor_to_rank_global_[global_offset + i];
+          reactor_to_batch_local_[i] = reactor_to_batch_global_[global_offset + i];
+      }
+
+
+
+      if(int_options_["verbosity"] > 1) {
+          printf("Rank %d: After redistribution, have %d reactors\n",
+                 rank_, n_reactors_self_);
+      }
+
+      return ZERORK_STATUS_SUCCESS;
+#else
+      if(rank_ == root_rank_) {
+      printf("Error: load_balance=3 requires ZERORK_GPU to be enabled.\n");
+    }
+    return ZERORK_STATUS_FAILED_OPTIONS_PARSE;
+#endif
   }
 
   MPI_Allgather(&n_weighted_reactors,1,MPI_INT,
@@ -828,6 +1602,15 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
   n_gpu_solve_ = 0;
   n_gpu_solve_no_temperature_ = 0;
 
+    //dont forget to set these to  0...
+    n_fe_ = 0;
+    n_setups_ = 0;
+    n_feLS_ = 0;
+    n_je_ = 0;
+    n_ni_ = 0;
+    n_cfn_ = 0;
+    n_etf_ = 0;
+
   int always_solve_temp = int_options_["always_solve_temperature"];
 
   int n_reactors_self_calc = n_reactors_self_ + n_reactors_other_;
@@ -888,145 +1671,536 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
       DumpReactor("pre", j, *T_ptrs[j], *P_ptrs[j], *rc_ptrs[j], *rg_ptrs[j], mf_ptrs[j]);
     }
   }
-
+    std::vector<int>solve_param(7,0);
 #ifdef ZERORK_GPU
-  if(int_options_["gpu"] != 0 && rank_has_gpu_[rank_]) {
-    //Instantiate reactors on first call, after options are set
-    if(!reactor_gpu_ptr_) {
-      if(int_options_["constant_volume"] == 1) {
-        reactor_gpu_ptr_ = std::make_unique<ReactorConstantVolumeGPU>(mech_cuda_ptr_);
-      } else {
-        reactor_gpu_ptr_ = std::make_unique<ReactorConstantPressureGPU>(mech_cuda_ptr_);
-      }
-    }
-    reactor_gpu_ptr_->SetIntOptions(int_options_);
-    reactor_gpu_ptr_->SetDoubleOptions(double_options_);
+//  if(int_options_["gpu"] != 0 && rank_has_gpu_[rank_] && getenv("USE_BATCH") != NULL) {
+//    //Instantiate reactors on first call, after options are set
+//    if(!reactor_gpu_ptr_) {
+//      if(int_options_["constant_volume"] == 1) {
+//        reactor_gpu_ptr_ = std::make_unique<ReactorConstantVolumeGPU>(mech_cuda_ptr_);
+//      } else {
+//        reactor_gpu_ptr_ = std::make_unique<ReactorConstantPressureGPU>(mech_cuda_ptr_);
+//      }
+//    }
+//    reactor_gpu_ptr_->SetIntOptions(int_options_);
+//    reactor_gpu_ptr_->SetDoubleOptions(double_options_);
+//
+//    std::vector<double> T_gpu(n_reactors_self_calc);
+//    std::vector<double> T_gpu_init(n_reactors_self_calc);
+//    std::vector<double> P_gpu(n_reactors_self_calc);
+//    std::vector<double> dpdt_gpu;
+//    if(dpdt_defined_) dpdt_gpu.resize(n_reactors_self_calc);
+//    std::vector<double> e_src_gpu;
+//    if(e_src_defined_) e_src_gpu.resize(n_reactors_self_calc);
+//    std::vector<double> y_src_gpu;
+//    if(y_src_defined_) y_src_gpu.resize(num_species_*n_reactors_self_calc);
+//    std::vector<double> mf_gpu(num_species_*n_reactors_self_calc);
+//    int n_remaining = n_reactors_self_calc;
+//
+//    //Okay here I need to call the sorting algorithm so I can replace n_curr with the bin sizes
+//
+//      const int n = n_reactors_self_calc;
+//      std::vector<double> weights_sorted(n);
+//
+////      for (int i = 0; i < n_reactors_self_; ++i) {
+////          const int ridx = (int)sorted_reactor_idxs_[i];
+////          weights_sorted[i] = rc_self_[ridx];
+////      }
+//
+//
+//      for (int i = 1; i < n; ++i) {
+//          if (weights_sorted[i] > weights_sorted[i-1]) {
+//              fprintf(stderr, "ERROR: weights_sorted must be non-increasing (descending)\n");
+//              break;
+//          }
+//      }
+//      for (int i = 0; i < n; ++i) {
+////          const int ridx = (int)sorted_reactor_idxs_[i];
+//          weights_sorted[i] = *rc_ptrs[i];
+//      }
+//
+//// 2) Decide number of bins
+//      const int num_bins = 2;
+//      std::cout<< "Sorting for: " << num_bins << " bins"<< std::endl;
+//
+////      const int num_bins = batch_per_gpu_ ; // or just batch_per_gpu_ if single GPU, your call
+//
+//// 3) Compute sizes
+//      auto bin_sizes = ComputeBinSizesMinimax(weights_sorted, num_bins);
+//
+//
+//
+//    for(int i=0;i<num_bins;i++) {
+//      int n_curr = bin_sizes[i];
+////      n_curr = std::min(n_remaining, int_options_["n_reactors_max"]);
+////      if(n_curr != n_remaining && n_remaining < 2*int_options_["n_reactors_max"] && n_curr == int_options_["n_reactors_max"]) {
+////        n_curr = n_remaining/2;
+////      }
+//
+//      if(n_curr >= int_options_["n_reactors_min"]) {
+//        if(int_options_["verbosity"] >= 2) {
+//            printf("RANK[%d]: Solving GPU group of size = %d.\n", rank_,n_curr);
+//        }
+//        n_gpu_groups_++;
+//
+//        // N.B. n_calls_ logic is a work-around to some memory issue that happens in cuSolverRf
+//        // it seems like if the smaller matrix is used first, some internal buffer is over-run
+//        // when we later call the functions with a larger matrix even though we destroy and create
+//        // a new cuSolverRf handle.
+//        bool solve_temperature = n_calls_ == 1 ? true : false;
+//        double start_time = getHighResolutionTime();
+//        for(int k = 0; k < n_curr; ++k)
+//        {
+//          int k_reactor = n_remaining - k - 1;
+//          int k_reactor_curr = n_curr - k - 1;
+//          T_gpu[k_reactor_curr] = *T_ptrs[k_reactor];
+//          T_gpu_init[k_reactor_curr] = *T_ptrs[k_reactor];
+//          P_gpu[k_reactor_curr] = *P_ptrs[k_reactor];
+//          if(dpdt_defined_) {
+//            dpdt_gpu[k_reactor_curr] = *dpdt_ptrs[k_reactor];
+//          }
+//          if(e_src_defined_) {
+//            e_src_gpu[k_reactor_curr] = *e_src_ptrs[k_reactor];
+//          }
+//          for(int j = 0; j < num_species_; ++j) {
+//            //Transpose mass fractions
+//            mf_gpu[j*n_curr+k_reactor_curr] = mf_ptrs[k_reactor][j];
+//            if(y_src_defined_) {
+//              y_src_gpu[j*n_curr+k_reactor_curr] = y_src_ptrs[k_reactor][j];
+//            }
+//          }
+//          if(*temp_delta_ptrs[k_reactor] > 0.0 || always_solve_temp == 1) {
+//            solve_temperature = true;
+//          }
+//        }
+//
+//        long int nstep_reactors;
+//        std::unique_ptr<SolverBase> solver;
+//        if(int_options_["integrator"] == 0) {
+//          solver.reset(new CvodeSolver(*reactor_gpu_ptr_));
+//        } else {
+//          solver.reset(new SeulexSolver(*reactor_gpu_ptr_));
+//        }
+//
+//        solver->SetIntOptions(int_options_);
+//        solver->SetDoubleOptions(double_options_);
+//        //if( cb_fn_ != nullptr && int_options_["load_balance"] == 0) {
+//        //  solver->SetCallbackFunction(cb_fn_, cb_fn_data_);
+//        //}
+//
+//        reactor_gpu_ptr_->SetSolveTemperature(solve_temperature);
+//        reactor_gpu_ptr_->SetIntOption("iterative",solver->Iterative());
+//        reactor_gpu_ptr_->SetStepLimiter(double_options_["step_limiter"]);
+//
+//        double* dpdt_ptr = nullptr;
+//        if(dpdt_defined_) {
+//          dpdt_ptr = &dpdt_gpu[0];
+//        }
+//        double* e_src_ptr = nullptr;
+//        if(e_src_defined_) {
+//          e_src_ptr = &e_src_gpu[0];
+//        }
+//        double* y_src_ptr = nullptr;
+//        if(y_src_defined_) {
+//          y_src_ptr = &y_src_gpu[0];
+//        }
+//        reactor_gpu_ptr_->InitializeState(0.0, n_curr, &T_gpu[0], &P_gpu[0],
+//                                          &mf_gpu[0], dpdt_ptr, e_src_ptr, y_src_ptr);
+//
+//        nstep_reactors = solver->Integrate(dt_calc_, &solve_param);
+//          double reactor_time = getHighResolutionTime() - start_time;
+//        reactor_gpu_ptr_->GetState(dt_calc_, &T_gpu[0], &P_gpu[0], &mf_gpu[0]);
+//
+//
+//        sum_gpu_reactor_time_ += reactor_time;
+//
+//        if(nstep_reactors >= 0) {
+//          n_steps_gpu_ += nstep_reactors*n_curr;
+//          n_gpu_solve_ += n_curr;
+//            n_fe_ += solve_param[0]*n_curr;
+//            n_setups_ += solve_param[1]*n_curr;
+//            n_feLS_ += solve_param[2]*n_curr;
+//            n_je_ += solve_param[3]*n_curr;
+//            n_ni_ += solve_param[4]*n_curr;
+//            n_cfn_ += solve_param[5]*n_curr;
+//            n_etf_ += solve_param[6]*n_curr;
+//          if(!solve_temperature) n_gpu_solve_no_temperature_ += n_curr;
+//          for(int k = 0; k < n_curr; ++k) {
+//            int k_reactor = n_remaining - k - 1;
+//            int k_reactor_curr = n_curr - k - 1;
+//            *T_ptrs[k_reactor] = T_gpu[k_reactor_curr];
+//            *P_ptrs[k_reactor] = P_gpu[k_reactor_curr];
+//            for(int j = 0; j < num_species_; ++j) {
+//              //Transpose mass fractions
+//              mf_ptrs[k_reactor][j] = mf_gpu[j*n_curr+k_reactor_curr];
+//            }
+//            solved_gpu[k_reactor] = 1;
+//            *rc_ptrs[k_reactor] = nstep_reactors;
+//            *rg_ptrs[k_reactor] = reactor_time/n_curr*gpu_multiplier_;
+//
+//            double temp_delta = T_gpu[k_reactor_curr] - T_gpu_init[k_reactor_curr];
+//            if(temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
+//            *temp_delta_ptrs[k_reactor] = temp_delta;
+//
+//            if(int_options_["dump_reactors"]!=0) {
+//              DumpReactor("postg", k_reactor, *T_ptrs[k_reactor], *P_ptrs[k_reactor],
+//                          *rc_ptrs[k_reactor], *rg_ptrs[k_reactor], mf_ptrs[k_reactor]);
+//            }
+//          }
+//        }
+//        n_remaining -= n_curr;
+//      } else {
+//        break;
+//      }
+//    }
+//
+//  }
 
-    std::vector<double> T_gpu(int_options_["n_reactors_max"]);
-    std::vector<double> T_gpu_init(int_options_["n_reactors_max"]);
-    std::vector<double> P_gpu(int_options_["n_reactors_max"]);
-    std::vector<double> dpdt_gpu;
-    if(dpdt_defined_) dpdt_gpu.resize(int_options_["n_reactors_max"]);
-    std::vector<double> e_src_gpu;
-    if(e_src_defined_) e_src_gpu.resize(int_options_["n_reactors_max"]);
-    std::vector<double> y_src_gpu;
-    if(y_src_defined_) y_src_gpu.resize(num_species_*int_options_["n_reactors_max"]);
-    std::vector<double> mf_gpu(num_species_*int_options_["n_reactors_max"]);
-    int n_remaining = n_reactors_self_calc;
-    while(n_remaining > 0) {
-      int n_curr = 1;
-      n_curr = std::min(n_remaining, int_options_["n_reactors_max"]);
-      if(n_curr != n_remaining && n_remaining < 2*int_options_["n_reactors_max"] && n_curr == int_options_["n_reactors_max"]) {
-        n_curr = n_remaining/2;
-      }
-
-      if(n_curr >= int_options_["n_reactors_min"]) {
-        if(int_options_["verbosity"] >= 2) {
-            printf("RANK[%d]: Solving GPU group of size = %d.\n", rank_,n_curr);
-        }
-        n_gpu_groups_++;
-
-        // N.B. n_calls_ logic is a work-around to some memory issue that happens in cuSolverRf
-        // it seems like if the smaller matrix is used first, some internal buffer is over-run
-        // when we later call the functions with a larger matrix even though we destroy and create
-        // a new cuSolverRf handle.
-        bool solve_temperature = n_calls_ == 1 ? true : false;
-        double start_time = getHighResolutionTime();
-        for(int k = 0; k < n_curr; ++k)
-        {
-          int k_reactor = n_remaining - k - 1;
-          int k_reactor_curr = n_curr - k - 1;
-          T_gpu[k_reactor_curr] = *T_ptrs[k_reactor];
-          T_gpu_init[k_reactor_curr] = *T_ptrs[k_reactor];
-          P_gpu[k_reactor_curr] = *P_ptrs[k_reactor];
-          if(dpdt_defined_) {
-            dpdt_gpu[k_reactor_curr] = *dpdt_ptrs[k_reactor];
-          }
-          if(e_src_defined_) {
-            e_src_gpu[k_reactor_curr] = *e_src_ptrs[k_reactor];
-          }
-          for(int j = 0; j < num_species_; ++j) {
-            //Transpose mass fractions
-            mf_gpu[j*n_curr+k_reactor_curr] = mf_ptrs[k_reactor][j];
-            if(y_src_defined_) {
-              y_src_gpu[j*n_curr+k_reactor_curr] = y_src_ptrs[k_reactor][j];
+    if (int_options_["gpu"] != 0 && rank_has_gpu_[rank_] && getenv("ZERORK_BATCH_PER_GPU") != NULL) {
+        // Instantiate reactors on first call, after options are set
+        if (!reactor_gpu_ptr_) {
+            if (int_options_["constant_volume"] == 1) {
+                reactor_gpu_ptr_ = std::make_unique<ReactorConstantVolumeGPU>(mech_cuda_ptr_);
+            } else {
+                reactor_gpu_ptr_ = std::make_unique<ReactorConstantPressureGPU>(mech_cuda_ptr_);
             }
-          }
-          if(*temp_delta_ptrs[k_reactor] > 0.0 || always_solve_temp == 1) {
-            solve_temperature = true;
-          }
+        }
+        reactor_gpu_ptr_->SetIntOptions(int_options_);
+        reactor_gpu_ptr_->SetDoubleOptions(double_options_);
+
+        const int n = n_reactors_self_calc;
+        int n_remaining = n;
+
+
+
+        std::vector<double> weights_sorted(n);
+        for (int ii = 0; ii < n; ++ii) {
+            weights_sorted[ii] = *rc_ptrs[ii];
+//            std::cout << "The weight is  " << weights_sorted[ii] << std::endl;
         }
 
-        long int nstep_reactors;
-        std::unique_ptr<SolverBase> solver;
-        if(int_options_["integrator"] == 0) {
-          solver.reset(new CvodeSolver(*reactor_gpu_ptr_));
-        } else {
-          solver.reset(new SeulexSolver(*reactor_gpu_ptr_));
+        // Choose number of bins (temporary hardcode; swap for env-driven batch_per_gpu_ later)
+        const int num_bins = batch_per_gpu_;
+        if (int_options_["verbosity"] >= 2) {
+            std::cout << "Sorting for: " << num_bins << " bins" << std::endl;
         }
 
-        solver->SetIntOptions(int_options_);
-        solver->SetDoubleOptions(double_options_);
-        //if( cb_fn_ != nullptr && int_options_["load_balance"] == 0) {
-        //  solver->SetCallbackFunction(cb_fn_, cb_fn_data_);
-        //}
+//        auto bin_sizes = ComputeBinSizesMinimax(weights_sorted, num_bins);
+        auto bin_sizes = ComputeBinSizesMinimax_New(weights_sorted, num_bins);
+        std::cout<< "Sorting done."<<std::endl;
 
-        reactor_gpu_ptr_->SetSolveTemperature(solve_temperature);
-        reactor_gpu_ptr_->SetIntOption("iterative",solver->Iterative());
-        reactor_gpu_ptr_->SetStepLimiter(double_options_["step_limiter"]);
-
-        double* dpdt_ptr = nullptr;
-        if(dpdt_defined_) {
-          dpdt_ptr = &dpdt_gpu[0];
+        // Sanity: ensure bins cover all reactors
+        long long sum_bins = 0;
+        for (int s : bin_sizes) sum_bins += s;
+        if (sum_bins != n) {
+            fprintf(stderr, "ERROR: bin_sizes sum=%lld != n=%d\n", sum_bins, n);
+            abort();
         }
-        double* e_src_ptr = nullptr;
-        if(e_src_defined_) {
-          e_src_ptr = &e_src_gpu[0];
-        }
-        double* y_src_ptr = nullptr;
-        if(y_src_defined_) {
-          y_src_ptr = &y_src_gpu[0];
-        }
-        reactor_gpu_ptr_->InitializeState(0.0, n_curr, &T_gpu[0], &P_gpu[0],
-                                          &mf_gpu[0], dpdt_ptr, e_src_ptr, y_src_ptr);
-        nstep_reactors = solver->Integrate(dt_calc_);
-        reactor_gpu_ptr_->GetState(dt_calc_, &T_gpu[0], &P_gpu[0], &mf_gpu[0]);
 
-        double reactor_time = getHighResolutionTime() - start_time;
-        sum_gpu_reactor_time_ += reactor_time;
+        // -------------------- solve per bin --------------------
+        for (int bi = 0; bi < (int)bin_sizes.size(); ++bi) {
+            int n_curr = bin_sizes[bi];
 
-        if(nstep_reactors >= 0) {
-          n_steps_gpu_ += nstep_reactors*n_curr;
-          n_gpu_solve_ += n_curr;
-          if(!solve_temperature) n_gpu_solve_no_temperature_ += n_curr;
-          for(int k = 0; k < n_curr; ++k) {
-            int k_reactor = n_remaining - k - 1;
-            int k_reactor_curr = n_curr - k - 1;
-            *T_ptrs[k_reactor] = T_gpu[k_reactor_curr];
-            *P_ptrs[k_reactor] = P_gpu[k_reactor_curr];
-            for(int j = 0; j < num_species_; ++j) {
-              //Transpose mass fractions
-              mf_ptrs[k_reactor][j] = mf_gpu[j*n_curr+k_reactor_curr];
+            if (n_curr <= 0) continue;
+            if (n_curr > n_remaining) n_curr = n_remaining;
+
+            if (n_curr < int_options_["n_reactors_min"]) {
+                break;
             }
-            solved_gpu[k_reactor] = 1;
-            *rc_ptrs[k_reactor] = nstep_reactors;
-            *rg_ptrs[k_reactor] = reactor_time/n_curr*gpu_multiplier_;
-
-            double temp_delta = T_gpu[k_reactor_curr] - T_gpu_init[k_reactor_curr];
-            if(temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
-            *temp_delta_ptrs[k_reactor] = temp_delta;
-
-            if(int_options_["dump_reactors"]!=0) {
-              DumpReactor("postg", k_reactor, *T_ptrs[k_reactor], *P_ptrs[k_reactor],
-                          *rc_ptrs[k_reactor], *rg_ptrs[k_reactor], mf_ptrs[k_reactor]);
+            if (n_curr > int_options_["n_reactors_max"]) {
+                fprintf(stderr, "ERROR: n_curr=%d > n_reactors_max=%d\n",
+                        n_curr, int_options_["n_reactors_max"]);
+                abort();
             }
-          }
+
+            if (int_options_["verbosity"] >= 2) {
+                printf("RANK[%d]: Solving GPU group of size = %d.\n", rank_, n_curr);
+            }
+            n_gpu_groups_++;
+
+            // N.B. n_calls_ logic is a work-around to some memory issue that happens in cuSolverRf
+            bool solve_temperature = (n_calls_ == 1) ? true : false;
+            double start_time = getHighResolutionTime();
+
+            // Allocate buffers sized exactly to n_curr (IMPORTANT)
+            std::vector<double> T_gpu(n_curr);
+            std::vector<double> T_gpu_init(n_curr);
+            std::vector<double> P_gpu(n_curr);
+
+            std::vector<double> dpdt_gpu;
+            if (dpdt_defined_) dpdt_gpu.resize(n_curr);
+
+            std::vector<double> e_src_gpu;
+            if (e_src_defined_) e_src_gpu.resize(n_curr);
+
+            std::vector<double> mf_gpu(num_species_ * n_curr);
+
+            std::vector<double> y_src_gpu;
+            if (y_src_defined_) y_src_gpu.resize(num_species_ * n_curr);
+
+
+            const int start = n - n_remaining;
+            for (int k = 0; k < n_curr; ++k) {
+//                const int k_reactor      = n_remaining - k - 1;  // keep existing ordering
+//                const int k_reactor_curr = n_curr - k - 1;
+
+                const int k_reactor      = start + k;  // reorder
+                const int k_reactor_curr = n_curr - k - 1;
+
+                T_gpu[k_reactor_curr]      = *T_ptrs[k_reactor];
+                T_gpu_init[k_reactor_curr] = *T_ptrs[k_reactor];
+                P_gpu[k_reactor_curr]      = *P_ptrs[k_reactor];
+
+                if (dpdt_defined_) {
+                    dpdt_gpu[k_reactor_curr] = *dpdt_ptrs[k_reactor];
+                }
+                if (e_src_defined_) {
+                    e_src_gpu[k_reactor_curr] = *e_src_ptrs[k_reactor];
+                }
+
+                for (int j = 0; j < num_species_; ++j) {
+                    mf_gpu[j * n_curr + k_reactor_curr] = mf_ptrs[k_reactor][j];
+                    if (y_src_defined_) {
+                        y_src_gpu[j * n_curr + k_reactor_curr] = y_src_ptrs[k_reactor][j];
+                    }
+                }
+
+                if (*temp_delta_ptrs[k_reactor] > 0.0 || always_solve_temp == 1) {
+                    solve_temperature = true;
+                }
+            }
+
+
+            long int nstep_reactors;
+            std::unique_ptr<SolverBase> solver;
+            if (int_options_["integrator"] == 0) {
+                solver.reset(new CvodeSolver(*reactor_gpu_ptr_));
+            } else {
+                solver.reset(new SeulexSolver(*reactor_gpu_ptr_));
+            }
+
+            solver->SetIntOptions(int_options_);
+            solver->SetDoubleOptions(double_options_);
+
+            reactor_gpu_ptr_->SetSolveTemperature(solve_temperature);
+            reactor_gpu_ptr_->SetIntOption("iterative", solver->Iterative());
+            reactor_gpu_ptr_->SetStepLimiter(double_options_["step_limiter"]);
+
+            double* dpdt_ptr = dpdt_defined_ ? dpdt_gpu.data() : nullptr;
+            double* e_src_ptr = e_src_defined_ ? e_src_gpu.data() : nullptr;
+            double* y_src_ptr = y_src_defined_ ? y_src_gpu.data() : nullptr;
+
+
+            reactor_gpu_ptr_->InitializeState(0.0, n_curr,
+                                              T_gpu.data(), P_gpu.data(),
+                                              mf_gpu.data(),
+                                              dpdt_ptr, e_src_ptr, y_src_ptr);
+
+            nstep_reactors = solver->Integrate(dt_calc_, &solve_param);
+            double batch_time = getHighResolutionTime() - start_time;
+            std::cout << "Integration time for batch: " <<bi<< " is: "<< batch_time <<" seconds"<<std::endl;
+            reactor_gpu_ptr_->GetState(dt_calc_, T_gpu.data(), P_gpu.data(), mf_gpu.data());
+
+            sum_gpu_reactor_time_ += batch_time;
+
+            // -------------------- unpack --------------------
+            if (nstep_reactors >= 0) {
+                n_steps_gpu_ += nstep_reactors * n_curr;
+                n_gpu_solve_ += n_curr;
+                n_fe_     += solve_param[0] * n_curr;
+                n_setups_ += solve_param[1] * n_curr;
+                n_feLS_   += solve_param[2] * n_curr;
+                n_je_     += solve_param[3] * n_curr;
+                n_ni_     += solve_param[4] * n_curr;
+                n_cfn_    += solve_param[5] * n_curr;
+                n_etf_    += solve_param[6] * n_curr;
+                if (!solve_temperature) n_gpu_solve_no_temperature_ += n_curr;
+
+                for (int k = 0; k < n_curr; ++k) {
+                    const int k_reactor      = start +k;
+                    const int k_reactor_curr = n_curr - k - 1;
+
+                    *T_ptrs[k_reactor] = T_gpu[k_reactor_curr];
+                    *P_ptrs[k_reactor] = P_gpu[k_reactor_curr];
+
+                    for (int j = 0; j < num_species_; ++j) {
+                        mf_ptrs[k_reactor][j] = mf_gpu[j * n_curr + k_reactor_curr];
+                    }
+
+                    solved_gpu[k_reactor] = 1;
+//                    *rc_ptrs[k_reactor] = nstep_reactors;
+                    *rg_ptrs[k_reactor] = batch_time / n_curr * gpu_multiplier_;
+
+                    double temp_delta = T_gpu[k_reactor_curr] - T_gpu_init[k_reactor_curr];
+                    if (temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
+                    *temp_delta_ptrs[k_reactor] = temp_delta;
+
+                    if (int_options_["dump_reactors"] != 0) {
+                        DumpReactor("postg", k_reactor,
+                                    *T_ptrs[k_reactor], *P_ptrs[k_reactor],
+                                    *rc_ptrs[k_reactor], *rg_ptrs[k_reactor],
+                                    mf_ptrs[k_reactor]);
+                    }
+                }
+            }
+
+            n_remaining -= n_curr;
+            if (n_remaining <= 0) break;
         }
-        n_remaining -= n_curr;
-      } else {
-        break;
+
+    } // end USE_BATCH branch
+
+
+
+
+    else if(int_options_["gpu"] != 0 && rank_has_gpu_[rank_]) {
+      //Instantiate reactors on first call, after options are set
+      if (!reactor_gpu_ptr_) {
+          if (int_options_["constant_volume"] == 1) {
+              reactor_gpu_ptr_ = std::make_unique<ReactorConstantVolumeGPU>(mech_cuda_ptr_);
+          } else {
+              reactor_gpu_ptr_ = std::make_unique<ReactorConstantPressureGPU>(mech_cuda_ptr_);
+          }
       }
-    }
+      reactor_gpu_ptr_->SetIntOptions(int_options_);
+      reactor_gpu_ptr_->SetDoubleOptions(double_options_);
+
+      std::vector<double> T_gpu(int_options_["n_reactors_max"]);
+      std::vector<double> T_gpu_init(int_options_["n_reactors_max"]);
+      std::vector<double> P_gpu(int_options_["n_reactors_max"]);
+      std::vector<double> dpdt_gpu;
+      if (dpdt_defined_) dpdt_gpu.resize(int_options_["n_reactors_max"]);
+      std::vector<double> e_src_gpu;
+      if (e_src_defined_) e_src_gpu.resize(int_options_["n_reactors_max"]);
+      std::vector<double> y_src_gpu;
+      if (y_src_defined_) y_src_gpu.resize(num_species_ * int_options_["n_reactors_max"]);
+      std::vector<double> mf_gpu(num_species_ * int_options_["n_reactors_max"]);
+      int n_remaining = n_reactors_self_calc;
+      while (n_remaining > 0) {
+          int n_curr = 1;
+          n_curr = std::min(n_remaining, int_options_["n_reactors_max"]);
+          if (n_curr != n_remaining && n_remaining < 2 * int_options_["n_reactors_max"] &&
+              n_curr == int_options_["n_reactors_max"]) {
+              n_curr = n_remaining / 2;
+          }
+
+          if (n_curr >= int_options_["n_reactors_min"]) {
+              if (int_options_["verbosity"] >= 2) {
+                  printf("RANK[%d]: Solving GPU group of size = %d.\n", rank_, n_curr);
+              }
+              n_gpu_groups_++;
+
+              // N.B. n_calls_ logic is a work-around to some memory issue that happens in cuSolverRf
+              // it seems like if the smaller matrix is used first, some internal buffer is over-run
+              // when we later call the functions with a larger matrix even though we destroy and create
+              // a new cuSolverRf handle.
+              bool solve_temperature = n_calls_ == 1 ? true : false;
+              double start_time = getHighResolutionTime();
+              for (int k = 0; k < n_curr; ++k) {
+                  int k_reactor = n_remaining - k - 1;
+                  int k_reactor_curr = n_curr - k - 1;
+                  T_gpu[k_reactor_curr] = *T_ptrs[k_reactor];
+                  T_gpu_init[k_reactor_curr] = *T_ptrs[k_reactor];
+                  P_gpu[k_reactor_curr] = *P_ptrs[k_reactor];
+                  if (dpdt_defined_) {
+                      dpdt_gpu[k_reactor_curr] = *dpdt_ptrs[k_reactor];
+                  }
+                  if (e_src_defined_) {
+                      e_src_gpu[k_reactor_curr] = *e_src_ptrs[k_reactor];
+                  }
+                  for (int j = 0; j < num_species_; ++j) {
+                      //Transpose mass fractions
+                      mf_gpu[j * n_curr + k_reactor_curr] = mf_ptrs[k_reactor][j];
+                      if (y_src_defined_) {
+                          y_src_gpu[j * n_curr + k_reactor_curr] = y_src_ptrs[k_reactor][j];
+                      }
+                  }
+                  if (*temp_delta_ptrs[k_reactor] > 0.0 || always_solve_temp == 1) {
+                      solve_temperature = true;
+                  }
+              }
+
+              long int nstep_reactors;
+              std::unique_ptr<SolverBase> solver;
+              if (int_options_["integrator"] == 0) {
+                  solver.reset(new CvodeSolver(*reactor_gpu_ptr_));
+              } else {
+                  solver.reset(new SeulexSolver(*reactor_gpu_ptr_));
+              }
+
+              solver->SetIntOptions(int_options_);
+              solver->SetDoubleOptions(double_options_);
+              //if( cb_fn_ != nullptr && int_options_["load_balance"] == 0) {
+              //  solver->SetCallbackFunction(cb_fn_, cb_fn_data_);
+              //}
+
+              reactor_gpu_ptr_->SetSolveTemperature(solve_temperature);
+              reactor_gpu_ptr_->SetIntOption("iterative", solver->Iterative());
+              reactor_gpu_ptr_->SetStepLimiter(double_options_["step_limiter"]);
+
+              double *dpdt_ptr = nullptr;
+              if (dpdt_defined_) {
+                  dpdt_ptr = &dpdt_gpu[0];
+              }
+              double *e_src_ptr = nullptr;
+              if (e_src_defined_) {
+                  e_src_ptr = &e_src_gpu[0];
+              }
+              double *y_src_ptr = nullptr;
+              if (y_src_defined_) {
+                  y_src_ptr = &y_src_gpu[0];
+              }
+              reactor_gpu_ptr_->InitializeState(0.0, n_curr, &T_gpu[0], &P_gpu[0],
+                                                &mf_gpu[0], dpdt_ptr, e_src_ptr, y_src_ptr);
+
+              nstep_reactors = solver->Integrate(dt_calc_, &solve_param);
+              double reactor_time = getHighResolutionTime() - start_time;
+              std::cout << "Oldntegration time for batch: " <<n_gpu_groups_<< " is: "<< reactor_time <<" seconds"<<std::endl;
+              reactor_gpu_ptr_->GetState(dt_calc_, &T_gpu[0], &P_gpu[0], &mf_gpu[0]);
+
+
+              sum_gpu_reactor_time_ += reactor_time;
+
+              if (nstep_reactors >= 0) {
+                  n_steps_gpu_ += nstep_reactors * n_curr;
+                  n_gpu_solve_ += n_curr;
+                  n_fe_ += solve_param[0] * n_curr;
+                  n_setups_ += solve_param[1] * n_curr;
+                  n_feLS_ += solve_param[2] * n_curr;
+                  n_je_ += solve_param[3] * n_curr;
+                  n_ni_ += solve_param[4] * n_curr;
+                  n_cfn_ += solve_param[5] * n_curr;
+                  n_etf_ += solve_param[6] * n_curr;
+                  if (!solve_temperature) n_gpu_solve_no_temperature_ += n_curr;
+                  for (int k = 0; k < n_curr; ++k) {
+                      int k_reactor = n_remaining - k - 1;
+                      int k_reactor_curr = n_curr - k - 1;
+                      *T_ptrs[k_reactor] = T_gpu[k_reactor_curr];
+                      *P_ptrs[k_reactor] = P_gpu[k_reactor_curr];
+                      for (int j = 0; j < num_species_; ++j) {
+                          //Transpose mass fractions
+                          mf_ptrs[k_reactor][j] = mf_gpu[j * n_curr + k_reactor_curr];
+                      }
+                      solved_gpu[k_reactor] = 1;
+                      *rc_ptrs[k_reactor] = nstep_reactors;
+                      *rg_ptrs[k_reactor] = reactor_time / n_curr * gpu_multiplier_;
+
+                      double temp_delta = T_gpu[k_reactor_curr] - T_gpu_init[k_reactor_curr];
+                      if (temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
+                      *temp_delta_ptrs[k_reactor] = temp_delta;
+
+                      if (int_options_["dump_reactors"] != 0) {
+                          DumpReactor("postg", k_reactor, *T_ptrs[k_reactor], *P_ptrs[k_reactor],
+                                      *rc_ptrs[k_reactor], *rg_ptrs[k_reactor], mf_ptrs[k_reactor]);
+                      }
+                  }
+              }
+              n_remaining -= n_curr;
+          } else {
+              break;
+          }
+      }
+
   }
 #endif //ZERORK_GPU
 
@@ -1089,7 +2263,7 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
                                     mf_ptrs[k], &dpdt_reactor,
                                     &e_src_reactor,
                                     y_src_reactor);
-      int nsteps = solver->Integrate(dt_calc_);
+      int nsteps = solver->Integrate(dt_calc_,&solve_param);
       double reactor_time = getHighResolutionTime() - start_time;
       if(nsteps < 0) {
         flag = ZERORK_STATUS_FAILED_SOLVE;
@@ -1101,6 +2275,13 @@ zerork_status_t ZeroRKReactorManager::SolveReactors()
         reactor_ptr_->GetState(dt_calc_, T_ptrs[k], P_ptrs[k], mf_ptrs[k]);
         *root_times_ptrs[k] = reactor_ptr_->GetRootTime();
         n_steps_cpu_ += nsteps;
+          n_fe_ += solve_param[0];
+          n_setups_ += solve_param[1];
+          n_feLS_ += solve_param[2];
+          n_je_ += solve_param[3];
+          n_ni_ += solve_param[4];
+          n_cfn_ += solve_param[5];
+          n_etf_ += solve_param[6];
         double temp_delta = *T_ptrs[k] - T_init;
         if(temp_delta < double_options_["solve_temperature_threshold"]) temp_delta = 0.0;
         *temp_delta_ptrs[k] = temp_delta;
@@ -1255,116 +2436,150 @@ zerork_status_t ZeroRKReactorManager::PostSolve() {
 
 void ZeroRKReactorManager::ProcessPerformance()
 {
-  double all_time = sum_cpu_reactor_time_ + sum_gpu_reactor_time_;
-  double max_cpu_reactor_time = sum_cpu_reactor_time_;
-  double max_gpu_reactor_time = sum_gpu_reactor_time_;
+    printf("cpu reactor time: %g, and gpu reactor time: %g, on rank: rank%d\n",sum_cpu_reactor_time_,sum_gpu_reactor_time_,rank_);
+    double all_time = sum_cpu_reactor_time_ + sum_gpu_reactor_time_;
+    double max_cpu_reactor_time = sum_cpu_reactor_time_;
+    double max_gpu_reactor_time = sum_gpu_reactor_time_;
 
-  n_reactors_solved_ranks_[rank_] = n_cpu_solve_ + n_gpu_solve_;
-  all_time_ranks_[rank_] = all_time;
+    n_reactors_solved_ranks_[rank_] = n_cpu_solve_ + n_gpu_solve_;
+    all_time_ranks_[rank_] = all_time;
 #ifdef USE_MPI
-  if(nranks_ > 1) {
-    int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
-    MPI_Gather(&n_total_solved,1,MPI_INT,&n_reactors_solved_ranks_[0],1,MPI_INT,root_rank_,MPI_COMM_WORLD);
-    MPI_Gather(&all_time,1,MPI_DOUBLE,&all_time_ranks_[0],1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
-    // Collect timing/step count data
-    double rr; //reduced real
-    int ri; //reduced int
+    if(nranks_ > 1) {
+        int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
+        MPI_Gather(&n_total_solved,1,MPI_INT,&n_reactors_solved_ranks_[0],1,MPI_INT,root_rank_,MPI_COMM_WORLD);
+        MPI_Gather(&all_time,1,MPI_DOUBLE,&all_time_ranks_[0],1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
+        // Collect timing/step count data
+        double rr; //reduced real
+        int ri; //reduced int
 
-    MPI_Reduce(&n_cpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_cpu_solve_ = ri;
-    MPI_Reduce(&n_cpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_cpu_solve_no_temperature_ = ri;
-    MPI_Reduce(&n_gpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_solve_ = ri;
-    MPI_Reduce(&n_gpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_solve_no_temperature_ = ri;
-    MPI_Reduce(&n_gpu_groups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_gpu_groups_ = ri;
+        MPI_Reduce(&n_cpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cpu_solve_ = ri;
+        MPI_Reduce(&n_cpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cpu_solve_no_temperature_ = ri;
+        MPI_Reduce(&n_gpu_solve_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_solve_ = ri;
+        MPI_Reduce(&n_gpu_solve_no_temperature_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_solve_no_temperature_ = ri;
+        MPI_Reduce(&n_gpu_groups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_gpu_groups_ = ri;
 
-    MPI_Reduce(&n_steps_cpu_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_steps_cpu_ = ri;
-    MPI_Reduce(&n_steps_gpu_,&ri,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) n_steps_gpu_ = ri;
+        MPI_Reduce(&n_steps_cpu_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_steps_cpu_ = ri;
+        MPI_Reduce(&n_steps_gpu_,&ri,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_steps_gpu_ = ri;
 
-    //Get max time for cpu and gpu
-    MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) max_cpu_reactor_time = rr;
-    MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) max_gpu_reactor_time = rr;
-    //Calc per step times based on sum of times
-    MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) sum_cpu_reactor_time_ = rr;
-    MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
-    if(rank_ == root_rank_) sum_gpu_reactor_time_ = rr;
-  } else {
-    max_cpu_reactor_time = sum_cpu_reactor_time_;
-    max_gpu_reactor_time = sum_gpu_reactor_time_;
-  }
+        MPI_Reduce(&n_fe_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_fe_ = ri;
+        MPI_Reduce(&n_setups_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_setups_ = ri;
+        MPI_Reduce(&n_feLS_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_feLS_ = ri;
+        MPI_Reduce(&n_je_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_je_ = ri;
+        MPI_Reduce(&n_ni_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_ni_ = ri;
+        MPI_Reduce(&n_cfn_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_cfn_ = ri;
+        MPI_Reduce(&n_etf_,&ri,1,MPI_INT,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) n_etf_ = ri;
+
+
+        //Get max time for cpu and gpu
+        MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) max_cpu_reactor_time = rr;
+        MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_MAX,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) max_gpu_reactor_time = rr;
+        //Calc per step times based on sum of times
+        MPI_Reduce(&sum_cpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) sum_cpu_reactor_time_ = rr;
+        MPI_Reduce(&sum_gpu_reactor_time_,&rr,1,MPI_DOUBLE,MPI_SUM,root_rank_,MPI_COMM_WORLD);
+        if(rank_ == root_rank_) sum_gpu_reactor_time_ = rr;
+    } else {
+        max_cpu_reactor_time = sum_cpu_reactor_time_;
+        max_gpu_reactor_time = sum_gpu_reactor_time_;
+    }
 #else
-  max_cpu_reactor_time = sum_cpu_reactor_time_;
+    max_cpu_reactor_time = sum_cpu_reactor_time_;
   max_gpu_reactor_time = sum_gpu_reactor_time_;
 #endif
-  if(rank_ == root_rank_) {
-    int n_steps_total = n_steps_cpu_ + n_steps_gpu_;
-    int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
-    double nstep_avg = n_total_solved > 0 ? n_steps_total/n_total_solved : 0;
+    if(rank_ == root_rank_) {
+        int n_steps_total = n_steps_cpu_ + n_steps_gpu_;
+        int n_total_solved = n_cpu_solve_ + n_gpu_solve_;
+        double nstep_avg = n_total_solved > 0 ? n_steps_total/n_total_solved : 0;
 
-    double nstep_avg_gpu = n_gpu_solve_ > 0 ? n_steps_gpu_/n_gpu_solve_ : 0;
-    double nstep_avg_cpu = n_cpu_solve_ > 0 ? n_steps_cpu_/n_cpu_solve_ : 0;
+        double nstep_avg_gpu = n_gpu_solve_ > 0 ? n_steps_gpu_/n_gpu_solve_ : 0;
+        double nstep_avg_cpu = n_cpu_solve_ > 0 ? n_steps_cpu_/n_cpu_solve_ : 0;
 
-    double cpu_per_step_time = n_cpu_solve_ > 0 ? sum_cpu_reactor_time_/n_steps_cpu_ : 0;
-    double gpu_per_step_time = n_gpu_solve_ > 0 ? sum_gpu_reactor_time_/n_steps_gpu_ : 0;
+        double fe_avg = n_total_solved > 0 ? n_fe_/n_total_solved : 0;
+        double setups_avg = n_total_solved > 0 ? n_setups_/n_total_solved : 0;
+        double feLS_avg = n_total_solved > 0 ? n_feLS_/n_total_solved : 0;
+        double je_avg = n_total_solved > 0 ? n_je_/n_total_solved : 0;
+        double ni_avg = n_total_solved > 0 ? n_ni_/n_total_solved : 0;
+        double cfn_avg = n_total_solved > 0 ? n_cfn_/n_total_solved : 0;
+        double etf_avg = n_total_solved > 0 ? n_etf_/n_total_solved : 0;
 
-    double avg_time = 0.0;
-    double max_time = 0.0;
-    double total_time = 0.0;
-    for(int i = 0; i < nranks_; ++i) {
-       max_time = std::max(max_time,all_time_ranks_[i]);
-       total_time += all_time_ranks_[i];
-    }
-    avg_time = total_time/nranks_;
-    avg_reactor_time_ = n_total_solved > 0 ? avg_time/n_total_solved : 1.0;
+        double cpu_per_step_time = n_cpu_solve_ > 0 ? sum_cpu_reactor_time_/n_steps_cpu_ : 0;
+        double gpu_per_step_time = n_gpu_solve_ > 0 ? sum_gpu_reactor_time_/n_steps_gpu_ : 0;
 
-    //Print stats to file
-    //reactor_log_file_ << std::setprecision(16);
-    reactor_log_file_ << std::setw(13) <<  n_cycle_;
-    reactor_log_file_ << std::setw(17) <<  n_total_solved;
-    reactor_log_file_ << std::setw(17) <<  n_cpu_solve_;
-    reactor_log_file_ << std::setw(17) <<  n_cpu_solve_no_temperature_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_solve_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_solve_no_temperature_;
-    reactor_log_file_ << std::setw(17) <<  n_gpu_groups_;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg_cpu;
-    reactor_log_file_ << std::setw(17) <<  nstep_avg_gpu;
-    reactor_log_file_ << std::setw(17) <<  max_cpu_reactor_time;
-    reactor_log_file_ << std::setw(17) <<  max_gpu_reactor_time;
-    reactor_log_file_ << std::setw(17) <<  cpu_per_step_time;
-    reactor_log_file_ << std::setw(17) <<  gpu_per_step_time;
-    reactor_log_file_ << std::setw(17) <<  avg_time;
-    reactor_log_file_ << std::setw(17) <<  max_time;
-    reactor_log_file_ << std::endl;
-    reactor_log_file_.flush();
-
-    if(int_options_["verbosity"] > 0) {
-      if(int_options_["load_balance"]) {
-        double wasted_time = max_time - avg_time;
+        double avg_time = 0.0;
+        double max_time = 0.0;
+        double total_time = 0.0;
         for(int i = 0; i < nranks_; ++i) {
-          printf("Rank %d calculated %d reactors in %f seconds.\n",i,n_reactors_solved_ranks_[i],all_time_ranks_[i]);
+            max_time = std::max(max_time,all_time_ranks_[i]);
+            total_time += all_time_ranks_[i];
         }
-        printf("Max Time, Avg Time, Wasted Time = %f, %f, %f\n",max_time,avg_time,wasted_time);
-      } else {
-        printf("Rank %d calculated %d reactors in %f seconds.\n",rank_,n_cpu_solve_+n_gpu_solve_,all_time_ranks_[rank_]);
-      }
+        avg_time = total_time/nranks_;
+        avg_reactor_time_ = n_total_solved > 0 ? avg_time/n_total_solved : 1.0;
+
+        //Print stats to file
+        //reactor_log_file_ << std::setprecision(16);
+        reactor_log_file_ << std::setw(13) <<  n_cycle_;
+        reactor_log_file_ << std::setw(17) <<  n_total_solved;
+        reactor_log_file_ << std::setw(17) <<  n_cpu_solve_;
+        reactor_log_file_ << std::setw(17) <<  n_cpu_solve_no_temperature_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_solve_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_solve_no_temperature_;
+        reactor_log_file_ << std::setw(17) <<  n_gpu_groups_;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg_cpu;
+        reactor_log_file_ << std::setw(17) <<  nstep_avg_gpu;
+        reactor_log_file_ << std::setw(17) <<  fe_avg;
+        reactor_log_file_ << std::setw(17) <<  setups_avg;
+        reactor_log_file_ << std::setw(17) <<  feLS_avg;
+        reactor_log_file_ << std::setw(17) <<  je_avg;
+        reactor_log_file_ << std::setw(17) <<  ni_avg;
+        reactor_log_file_ << std::setw(17) <<  cfn_avg;
+        reactor_log_file_ << std::setw(17) <<  etf_avg;
+        reactor_log_file_ << std::setw(17) <<  max_cpu_reactor_time;
+        reactor_log_file_ << std::setw(17) <<  max_gpu_reactor_time;
+        reactor_log_file_ << std::setw(17) <<  cpu_per_step_time;
+        reactor_log_file_ << std::setw(17) <<  gpu_per_step_time;
+        reactor_log_file_ << std::setw(17) <<  avg_time;
+        reactor_log_file_ << std::setw(17) <<  max_time;
+        reactor_log_file_ << std::endl;
+        reactor_log_file_.flush();
+
+        if(int_options_["verbosity"] > 0) {
+            if(int_options_["load_balance"]) {
+                double wasted_time = max_time - avg_time;
+                for(int i = 0; i < nranks_; ++i) {
+                    printf("Rank %d calculated %d reactors in %f seconds.\n",i,n_reactors_solved_ranks_[i],all_time_ranks_[i]);
+                }
+                printf("Max Time, Avg Time, Wasted Time = %f, %f, %f\n",max_time,avg_time,wasted_time);
+            } else {
+                printf("Rank %d calculated %d reactors in %f seconds.\n",rank_,n_cpu_solve_+n_gpu_solve_,all_time_ranks_[rank_]);
+            }
+        }
     }
-  }
 #ifdef USE_MPI
-  if(int_options_["load_balance"] == 2) {
-    MPI_Bcast(&avg_reactor_time_,1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
-  }
+    if(int_options_["load_balance"] == 2) {
+        MPI_Bcast(&avg_reactor_time_,1,MPI_DOUBLE,root_rank_,MPI_COMM_WORLD);
+    }
 #endif
-  //commTime += getHighResolutionTime() - startTime;
+    //commTime += getHighResolutionTime() - startTime;
 }
+
+
 
 
 #ifdef ZERORK_GPU
@@ -1466,5 +2681,6 @@ void ZeroRKReactorManager::DumpReactor(std::string tag, int id, double T, double
       dump_file << "\n";
       dump_file.close();
 }
+
 
 

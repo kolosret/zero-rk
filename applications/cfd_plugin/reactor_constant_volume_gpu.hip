@@ -184,6 +184,8 @@ int ReactorConstantVolumeGPU::GetTimeDerivative(const double reactor_time,
   double* y_ptr_dev = N_VGetDeviceArrayPointer_Hip(state);
   double* ydot_ptr_dev = N_VGetDeviceArrayPointer_Hip(derivative);
 
+//double startTime=zerork::getHighResolutionTime();
+
 #ifdef ZERORK_NEG_CONC_CHECK
   int neg_fractions_flag = this->CheckMassFractionsDevice(y_ptr_dev);
   if(neg_mass_fracs == 1) {
@@ -202,7 +204,7 @@ int ReactorConstantVolumeGPU::GetTimeDerivative(const double reactor_time,
     thrust::transform(e_src_dev_.begin(), e_src_dev_.end(), initial_energies_dev_.begin(), energies_dev.begin(), saxpy_functor<double>(delta_t));
     mech_ptr_->getTemperatureFromEY_mr_dev(num_reactors_, thrust::raw_pointer_cast(&energies_dev[0]), y_ptr_dev, thrust::raw_pointer_cast(&temperatures_dev_[0]));
   }
-
+//    double endTime=zerork::getHighResolutionTime(); //End1
   thrust::device_vector<double> current_inverse_densities_dev = inverse_densities_dev_;
   if(dpdts_dev_.size() != 0) {
     const double delta_t = reactor_time-initial_time_;
@@ -215,19 +217,20 @@ int ReactorConstantVolumeGPU::GetTimeDerivative(const double reactor_time,
                                         thrust::raw_pointer_cast(&current_inverse_densities_dev[0]));
     thrust::transform(current_inverse_densities_dev.begin(),current_inverse_densities_dev.end(),current_inverse_densities_dev.begin(),invert_functor<double>());
   }
-
+//    double endTime=zerork::getHighResolutionTime(); //End2
   // set concentration via density and mass fraction
   mech_ptr_->getCfromVY_mr_dev(num_reactors_,thrust::raw_pointer_cast(&current_inverse_densities_dev[0]),y_ptr_dev,thrust::raw_pointer_cast(&concentrations_dev_[0]));
 
+//    double endTime=zerork::getHighResolutionTime(); //End3
   // compute the molar production rates at the current state (aka wdot)
   mech_ptr_->getReactionRatesLimiter_CUDA_mr_dev(num_reactors_,thrust::raw_pointer_cast(&temperatures_dev_[0]),
                                       thrust::raw_pointer_cast(&concentrations_dev_[0]), thrust::raw_pointer_cast(&step_limiter_[0]),
                                       thrust::raw_pointer_cast(&net_production_rates_dev_[0]),
                                       thrust::raw_pointer_cast(&creation_rates_dev_[0]),thrust::raw_pointer_cast(&destruction_rates_dev_[0]),
                                       thrust::raw_pointer_cast(&forward_rates_of_production_dev_[0]));
-
+//    double endTime=zerork::getHighResolutionTime(); //End4
   this->ConcentrationDerivative(thrust::raw_pointer_cast(&current_inverse_densities_dev[0]), ydot_ptr_dev);
-
+//    double endTime=zerork::getHighResolutionTime(); //End5
   if(solve_temperature_) {
     mech_ptr_->getIntEnergy_RT_mr_dev(num_reactors_,thrust::raw_pointer_cast(&temperatures_dev_[0]),thrust::raw_pointer_cast(&energy_dev_[0]));
     mech_ptr_->getMassCvFromTY_mr_dev(num_reactors_,thrust::raw_pointer_cast(&temperatures_dev_[0]),y_ptr_dev,
@@ -235,7 +238,15 @@ int ReactorConstantVolumeGPU::GetTimeDerivative(const double reactor_time,
 
     this->TemperatureDerivative(thrust::raw_pointer_cast(&current_inverse_densities_dev[0]), y_ptr_dev, ydot_ptr_dev);
   }
-
+//    hipError_t err = hipDeviceSynchronize();   // NOTE: hipError_t (no space, no 'e')
+//    if (err != hipSuccess) {
+//        fprintf(stderr, "HIP error %d after solve: %s\n",
+//                err, hipGetErrorString(err));
+//    }
+//  double endTime=zerork::getHighResolutionTime();
+//  double duration=endTime-startTime;
+//    std::cout << ""
+//              << duration<< " RHSDevice " << endl;
   return 0;
 }
 

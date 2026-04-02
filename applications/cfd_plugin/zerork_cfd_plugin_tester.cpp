@@ -295,9 +295,9 @@ void zerork_reactor(int inp_argc, char **inp_argv)
   int n_steps = inputFileDB.n_steps();
 
   // timing data
-  double startTime,stopTime,otherTime,simTime;
+  double startTime,stopTime,otherTime,simTime,duration,startTime2;
   startTime=getHighResolutionTime();
-
+    duration=0;
   int rank = 0;
   int nranks = 1;
 #ifdef USE_MPI
@@ -321,15 +321,36 @@ void zerork_reactor(int inp_argc, char **inp_argv)
     printf("         Running in batched mode.\n");
   }
 
+
+
+
+    zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
+    startTime=getHighResolutionTime();
   zerork_status_t flag = ZERORK_STATUS_SUCCESS;
   int num_solution_failures = 0;
   double t = 0;
   double dt= tend/n_steps;
   for(int i = 0; i < n_steps; ++i) {
+
+      if(i==0){
+      if (nReactors == 10) {
+          const double w10[10] = { 90.0,100.0,  80.0, 70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0 };
+          for (int k = 0; k < 10; ++k) reactorCost[k] = w10[k];
+          zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
+      }}else{if (nReactors == 10) {
+              const double w10[10] = { 90.0,  80.0, 100.0,70.0, 60.0, 50.0, 40.0, 30.0, 20.0, 10.0 };
+              for (int k = 0; k < 10; ++k) reactorCost[k] = w10[k];
+              zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_COST, &reactorCost[0], zrm_handle);
+          }
+
+      }
+
       if(!inputFileDB.batched() && nranks == 1) {
 #ifdef USE_OMP
         #pragma omp parallel for reduction(+:num_solution_failures)
 #endif
+
+
         for(int k = 0; k < nReactors; ++k) {
             ud.nsteps = 0;
             ud.time = 0.0;
@@ -349,8 +370,12 @@ void zerork_reactor(int inp_argc, char **inp_argv)
             if(inputFileDB.y_src() != 0.0) {
                 zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_Y_SRC, &reactorYsrc[k*nSpc], zrm_handle);
             }
+
+
+
             flag = zerork_reactor_solve(i, t, dt, 1, &reactorT[k], &reactorP[k],
                                         &reactorMassFrac[k*nSpc], zrm_handle);
+
             if(flag != ZERORK_STATUS_SUCCESS) num_solution_failures+=1;
         }
       } else {
@@ -371,8 +396,10 @@ void zerork_reactor(int inp_argc, char **inp_argv)
         if(inputFileDB.y_src() != 0.0) {
             zerork_reactor_set_aux_field_pointer(ZERORK_FIELD_Y_SRC, &reactorYsrc[0], zrm_handle);
         }
+        startTime2=getHighResolutionTime();
         flag = zerork_reactor_solve(i, t, dt, nReactors, &reactorT[0], &reactorP[0],
                                     &reactorMassFrac[0], zrm_handle);
+          duration+=getHighResolutionTime()-startTime2;
         if(flag != ZERORK_STATUS_SUCCESS) num_solution_failures+=1;
       }
       if(rank==0) {
@@ -397,7 +424,7 @@ void zerork_reactor(int inp_argc, char **inp_argv)
 
   stopTime=getHighResolutionTime();
   simTime=stopTime-startTime;
-  printf("simTime : %g s\n",simTime);
+  printf("simTime : %g s for rank: rank%d\n",duration,rank);
 #ifdef USE_OMP
 #pragma omp parallel
   {
